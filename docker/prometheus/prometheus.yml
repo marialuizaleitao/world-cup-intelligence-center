@@ -1,0 +1,59 @@
+# =============================================================================
+# WCIC — docker/prometheus/prometheus.yml
+# Configuração do Prometheus: targets de scrape e intervalos
+# =============================================================================
+
+global:
+  scrape_interval: 15s          # Coleta métricas a cada 15 segundos
+  evaluation_interval: 15s      # Avalia regras de alerta a cada 15 segundos
+  scrape_timeout: 10s
+
+  external_labels:
+    project: 'wcic'
+    environment: 'development'
+
+# Arquivos de regras de alerta
+rule_files:
+  - "rules/workflow_alerts.yml"
+  - "rules/api_alerts.yml"
+  - "rules/infrastructure_alerts.yml"
+
+# =============================================================================
+# SCRAPE CONFIGS
+# =============================================================================
+
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # n8n —> métricas nativas (ativado via N8N_METRICS=true)
+  # Expõe: execuções por workflow, duração, erros, fila de workers
+  - job_name: 'n8n'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['n8n:5678']
+    metric_relabel_configs:
+      # Adiciona prefixo wcic_ a todas as métricas do n8n
+      - source_labels: [__name__]
+        regex: 'n8n_(.*)'
+        target_label: __name__
+        replacement: 'wcic_n8n_${1}'
+
+  # API WCIC —> métricas customizadas do Express
+  - job_name: 'wcic-api'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['api:8080']
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # Redis Exporter
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
