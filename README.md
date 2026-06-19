@@ -13,7 +13,39 @@
 
 ## O que é este projeto?
 
-O WCIC não é só uma automação, ele é uma plataforma de produto com arquitetura distribuída que demonstra como sistemas de inteligência de dados são construídos em ambientes corporativos reais.
+O WCIC não é só uma automação, ele é uma plataforma de produto com arquitetura distribuída que demonstra como sistemas de inteligência de dados são construídos em ambientes corporativos reais. 
+
+## Motivação
+
+Este projeto foi desenvolvido para exercitar competências em:
+
+- Arquitetura de automações
+- Integração de sistemas
+- Engenharia de dados
+- Observabilidade
+- Inteligência Artificial aplicada
+- Desenvolvimento orientado a eventos
+
+O objetivo foi simular um produto utilizado por empresas de mídia esportiva e análise de dados durante grandes eventos esportivos.
+
+```mermaid
+graph LR
+
+A[Sports APIs]
+B[n8n Queue Mode]
+C[PostgreSQL]
+D[Redis]
+E[GPT-4o Agents]
+F[Grafana]
+G[REST API]
+
+A --> B
+B --> C
+B --> D
+B --> E
+C --> G
+C --> F
+```
 
 **O que o sistema faz:**
 
@@ -133,6 +165,20 @@ world-cup-intelligence-center/
 
 ---
 
+## Padrões Arquiteturais Utilizados
+
+- Event Driven Architecture
+- Queue-Based Processing
+- Circuit Breaker
+- Retry with Exponential Backoff
+- Dead Letter Queue
+- Cache Aside
+- API Gateway Pattern
+- AI Agent Orchestration
+- Observability First
+
+---
+
 ## Roadmap
 
 - [x] Sprint 0 — Estrutura base e documentação
@@ -142,6 +188,18 @@ world-cup-intelligence-center/
 - [ ] Sprint 4 — WF-03 News Intelligence + WF-04 Sentiment
 - [ ] Sprint 5 — WF-05 AI Predictions + WF-11 Accuracy Tracker
 - [ ] Sprint 6 — Observabilidade completa (Grafana + Prometheus)
+
+---
+
+## Objetivos de Performance
+
+| Métrica | Meta |
+|----------|----------|
+| Event Processing Latency | < 2 min |
+| Prediction Generation | < 15s |
+| Notification Delivery | < 10s |
+| Workflow Success Rate | > 99% |
+| API Availability | 99.9% |
 
 ---
 
