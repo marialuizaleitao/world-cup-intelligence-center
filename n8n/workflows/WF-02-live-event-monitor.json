@@ -1,0 +1,518 @@
+{
+  "name": "WF-02 - Live Event Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "* * * * *" }]
+        }
+      },
+      "id": "node-schedule",
+      "name": "Schedule Trigger (60s)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const startedAt = new Date().toISOString();\nconst executionId = $execution.id;\nconst { v4: uuidv4 } = require('uuid');\nconst correlationId = uuidv4();\n\nreturn [{\n  json: {\n    correlationId,\n    startedAt,\n    executionId,\n    workflowName: 'WF-02-live-event-monitor',\n    activeMatchesKey: 'wcic:active_matches',\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "operation": "smembers",
+        "key": "=wcic:active_matches"
+      },
+      "id": "node-get-active",
+      "name": "Get Active Matches",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifica se há jogos ao vivo\n// Redis SMEMBERS retorna { value: [id1, id2, ...] } ou { value: [] }\nconst result = $input.first().json;\nconst initData = $('Init').first().json;\n\nconst members = result.value || [];\nconst activeIds = Array.isArray(members) ? members.filter(Boolean) : [];\n\nif (activeIds.length === 0) {\n  return [{ json: { hasActiveMatches: false, activeIds: [], ...initData } }];\n}\n\nreturn [{ json: { hasActiveMatches: true, activeIds, activeCount: activeIds.length, ...initData } }];\n"
+      },
+      "id": "node-check-active",
+      "name": "Check Active Matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "has-active",
+              "leftValue": "={{ $json.hasActiveMatches }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-has-active-if",
+      "name": "Has Active Matches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (\n  execution_id, workflow_name, status, started_at, finished_at,\n  duration_ms, trigger_type, correlation_id, items_processed, output_summary\n) VALUES (\n  $1, 'WF-02-live-event-monitor', 'success', $2::timestamptz, NOW(),\n  EXTRACT(EPOCH FROM (NOW() - $2::timestamptz)) * 1000,\n  'cron', $3::uuid, 0, '{\"reason\": \"no_active_matches\"}'::jsonb\n);",
+        "additionalFields": {
+          "queryParams": "={{ [$json.executionId, $json.startedAt, $json.correlationId] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-no-active",
+      "name": "Log No Active Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 260],
+      "credentials": {
+        "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Expande activeIds em itens individuais para o SplitInBatches\nconst { activeIds, correlationId, startedAt, executionId } = $input.first().json;\n\nreturn activeIds.map(matchId => ({\n  json: { matchId, correlationId, startedAt, executionId }\n}));\n"
+      },
+      "id": "node-expand-matches",
+      "name": "Expand Match IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 540]
+    },
+    {
+      "parameters": {
+        "batchSize": 5,
+        "options": {}
+      },
+      "id": "node-split-batches",
+      "name": "Split in Batches (5)",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1560, 540]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `wcic:live:cursor:${$json.matchId}` }}"
+      },
+      "id": "node-get-cursor",
+      "name": "Get Event Cursor",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1780, 540],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Prepare API Call\n// Recupera o match UUID interno a partir do match_id Redis\n// e prepara o cursor para filtrar eventos já processados\n// ============================================================\nconst cursorResult = $input.first().json;\nconst batchItem = $('Split in Batches (5)').item.json;\n\nlet cursor = { lastExternalId: null, lastMinute: -1 };\nif (cursorResult.value) {\n  try { cursor = JSON.parse(cursorResult.value); } catch(e) { /* cursor corrompido, reinicia */ }\n}\n\nreturn [{\n  json: {\n    ...batchItem,\n    cursor,\n    // matchId aqui é o UUID interno do PostgreSQL (populado pelo WF-01 no SADD)\n    apiUrl: `https://api.football-data.org/v4/matches/${batchItem.matchId}`,\n  }\n}];\n"
+      },
+      "id": "node-prepare-api-call",
+      "name": "Prepare API Call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 540]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.apiUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "options": { "timeout": 12000, "response": { "response": { "fullResponse": true } } }
+      },
+      "id": "node-fetch-match",
+      "name": "Fetch Match Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 540],
+      "credentials": {
+        "httpHeaderAuth": { "id": "cred-football-data", "name": "Football Data API" }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Handle API Error\n// Incrementa contador de erros para este match_id\n// Após 3 erros consecutivos, remove da active_matches\n// ============================================================\nconst batchItem = $('Split in Batches (5)').item.json;\nconst errorCountKey = `wcic:errors:wf02:${batchItem.matchId}`;\n\nconsole.error(`[WF-02] API error for match ${batchItem.matchId}: ${JSON.stringify($input.first().json)}`);\n\nreturn [{\n  json: {\n    ...batchItem,\n    error_count_key: errorCountKey,\n    is_api_error: true,\n  }\n}];\n"
+      },
+      "id": "node-handle-api-error",
+      "name": "Handle API Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 400]
+    },
+    {
+      "parameters": {
+        "operation": "incr",
+        "key": "={{ $json.error_count_key }}"
+      },
+      "id": "node-incr-error",
+      "name": "Increment Error Count",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2660, 400],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "={{ $('Handle API Error').item.json.error_count_key }}",
+        "ttl": 300
+      },
+      "id": "node-error-ttl",
+      "name": "Set Error TTL",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2880, 400],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "error-threshold",
+              "leftValue": "={{ $json.value }}",
+              "rightValue": 3,
+              "operator": { "type": "number", "operation": "gte" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-error-threshold",
+      "name": "3+ Errors?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3100, 400]
+    },
+    {
+      "parameters": {
+        "operation": "srem",
+        "key": "=wcic:active_matches",
+        "value": "={{ $('Handle API Error').item.json.matchId }}"
+      },
+      "id": "node-remove-bad-match",
+      "name": "Remove from Active (Error)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3320, 320],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Parse Events\n// Extrai eventos da resposta da API e filtra apenas os novos\n// usando o cursor (lastExternalId ou lastMinute)\n// ============================================================\nconst apiResponse = $input.first().json;\nconst prepData = $('Prepare API Call').item.json;\nconst { cursor } = prepData;\n\nconst body = apiResponse.body || apiResponse;\n\n// Football-Data API retorna eventos em match.goals, match.bookings, match.substitutions\n// Normaliza tudo em um array único de eventos\nconst rawGoals   = body.goals   || [];\nconst rawCards   = body.bookings || [];\nconst rawSubs    = body.substitutions || [];\nconst rawScore   = body.score || {};\nconst matchStatus = body.status || 'UNKNOWN';\nconst homeScore  = rawScore?.fullTime?.home;\nconst awayScore  = rawScore?.fullTime?.away;\nconst homeScoreHT = rawScore?.halfTime?.home;\nconst awayScoreHT = rawScore?.halfTime?.away;\n\nconst STATUS_MAP = {\n  'IN_PLAY': 'live', 'PAUSED': 'halftime', 'FINISHED': 'finished',\n  'SCHEDULED': 'scheduled', 'TIMED': 'scheduled',\n};\n\n// Normaliza goals\nconst normalizedEvents = [];\n\nfor (const g of rawGoals) {\n  const extId = String(g.id || `goal_${g.minute?.regular || 0}_${g.scorer?.id || 'unk'}`);\n  normalizedEvents.push({\n    external_id: extId,\n    event_type: g.type === 'OWN_GOAL' ? 'own_goal' : g.type === 'PENALTY' ? 'penalty_scored' : 'goal',\n    minute: g.minute?.regular || 0,\n    extra_minute: g.minute?.injury || null,\n    period: 'regular',\n    team_external_id: String(g.team?.id || ''),\n    player_name: g.scorer?.name || null,\n    player_external_id: String(g.scorer?.id || ''),\n    assist_player_name: g.assist?.name || null,\n    assist_player_external_id: String(g.assist?.id || ''),\n    detail: null,\n    raw: g,\n  });\n}\n\nfor (const c of rawCards) {\n  const extId = String(c.id || `card_${c.minute?.regular || 0}_${c.player?.id || 'unk'}`);\n  const cardType = c.card === 'RED_CARD' ? 'red_card' : c.card === 'YELLOW_RED_CARD' ? 'second_yellow' : 'yellow_card';\n  normalizedEvents.push({\n    external_id: extId,\n    event_type: cardType,\n    minute: c.minute?.regular || 0,\n    extra_minute: c.minute?.injury || null,\n    period: 'regular',\n    team_external_id: String(c.team?.id || ''),\n    player_name: c.player?.name || null,\n    player_external_id: String(c.player?.id || ''),\n    assist_player_name: null,\n    assist_player_external_id: null,\n    detail: null,\n    raw: c,\n  });\n}\n\nfor (const s of rawSubs) {\n  const extId = String(s.id || `sub_${s.minute?.regular || 0}_${s.playerOut?.id || 'unk'}`);\n  normalizedEvents.push({\n    external_id: extId,\n    event_type: 'substitution',\n    minute: s.minute?.regular || 0,\n    extra_minute: s.minute?.injury || null,\n    period: 'regular',\n    team_external_id: String(s.team?.id || ''),\n    player_name: s.playerIn?.name || null,\n    player_external_id: String(s.playerIn?.id || ''),\n    player_out_name: s.playerOut?.name || null,\n    player_out_external_id: String(s.playerOut?.id || ''),\n    detail: null,\n    raw: s,\n  });\n}\n\n// Filtra apenas eventos novos (external_id não visto antes)\n// O cursor armazena o set de external_ids já processados\nconst processedIds = new Set(cursor.processedIds || []);\nconst newEvents = normalizedEvents.filter(e => !processedIds.has(e.external_id));\n\n// Atualiza cursor com todos os IDs (novos + antigos)\nconst allProcessedIds = [...processedIds, ...newEvents.map(e => e.external_id)];\n// Mantém apenas os últimos 200 IDs para não crescer indefinidamente\nconst updatedCursor = {\n  processedIds: allProcessedIds.slice(-200),\n  lastMinute: Math.max(...normalizedEvents.map(e => e.minute || 0), cursor.lastMinute || 0),\n  updatedAt: new Date().toISOString(),\n};\n\nreturn [{\n  json: {\n    matchId: prepData.matchId,\n    correlationId: prepData.correlationId,\n    matchStatus: STATUS_MAP[matchStatus] || 'live',\n    homeScore, awayScore, homeScoreHT, awayScoreHT,\n    newEvents,\n    newEventCount: newEvents.length,\n    updatedCursor,\n    hasNewEvents: newEvents.length > 0,\n  }\n}];\n"
+      },
+      "id": "node-parse-events",
+      "name": "Parse & Filter Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 620]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `wcic:live:cursor:${$json.matchId}` }}",
+        "value": "={{ JSON.stringify($json.updatedCursor) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 14400
+      },
+      "id": "node-update-cursor",
+      "name": "Update Cursor",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2660, 620],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "has-new-events",
+              "leftValue": "={{ $json.hasNewEvents }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-has-new-events",
+      "name": "Has New Events?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2880, 620]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Expande newEvents em itens individuais para processamento\nconst { newEvents, matchId, correlationId, homeScore, awayScore, homeScoreHT, awayScoreHT, matchStatus } = $input.first().json;\n\n// Busca dados do match no banco para enriquecer notificações\n// (times, placar etc.) - passado como contexto\nreturn newEvents.map(evt => ({\n  json: {\n    ...evt,\n    matchId,\n    correlationId,\n    homeScore,\n    awayScore,\n    homeScoreHT,\n    awayScoreHT,\n    matchStatus,\n  }\n}));\n"
+      },
+      "id": "node-expand-events",
+      "name": "Expand Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 560]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH team_ids AS (\n  SELECT id, external_id FROM wcic.teams\n  WHERE external_id = $4\n),\nplayer_ids AS (\n  SELECT id, external_id FROM wcic.players\n  WHERE external_id = $5 OR external_id = $6\n)\nINSERT INTO wcic.match_events (\n  match_id, external_id, event_type, minute, extra_minute,\n  period, team_id, player_id, assist_player_id,\n  is_confirmed, raw_payload, created_at\n)\nSELECT\n  $1::uuid,\n  $2,\n  $3::wcic.event_type,\n  $7::smallint,\n  $8::smallint,\n  $9,\n  (SELECT id FROM team_ids LIMIT 1),\n  (SELECT id FROM player_ids WHERE external_id = $5 LIMIT 1),\n  (SELECT id FROM player_ids WHERE external_id = $6 LIMIT 1),\n  true,\n  $10::jsonb,\n  NOW()\nON CONFLICT (match_id, external_id)\nWHERE external_id IS NOT NULL\nDO NOTHING\nRETURNING id::text, match_id::text, event_type, minute, external_id;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.matchId,\n  $json.external_id,\n  $json.event_type,\n  $json.team_external_id || null,\n  $json.player_external_id || null,\n  $json.assist_player_external_id || null,\n  $json.minute,\n  $json.extra_minute || null,\n  $json.period || 'regular',\n  JSON.stringify($json.raw || {})\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-insert-event",
+      "name": "Insert Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3320, 560],
+      "credentials": {
+        "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "=wcic:pub:events.live",
+        "value": "={{ JSON.stringify({ match_id: $('Expand Events').item.json.matchId, event_type: $('Expand Events').item.json.event_type, minute: $('Expand Events').item.json.minute, external_id: $('Expand Events').item.json.external_id, correlation_id: $('Expand Events').item.json.correlationId, home_score: $('Expand Events').item.json.homeScore, away_score: $('Expand Events').item.json.awayScore, ts: new Date().toISOString() }) }}"
+      },
+      "id": "node-publish-event",
+      "name": "Publish Event",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3540, 560],
+      "credentials": {
+        "redis": { "id": "cred-redis", "name": "WCIC Redis" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Should Notify?\n// Decide se este evento merece notificação para usuários\n// Gols, cartões vermelhos e VAR confirmado → SIM\n// Cartões amarelos, substituições → NÃO (apenas log)\n// ============================================================\nconst evt = $('Expand Events').item.json;\nconst insertResult = $('Insert Event').item.json;\n\n// Se ON CONFLICT DO NOTHING não inseriu nada, external_id era duplicata\n// O node PostgreSQL retorna array vazio quando DO NOTHING ocorre\nconst wasInserted = insertResult?.id != null;\n\nconst NOTIFY_TYPES = {\n  'goal': { notify: true, type: 'goal_alert', priority: 'critical' },\n  'own_goal': { notify: true, type: 'own_goal_alert', priority: 'critical' },\n  'penalty_scored': { notify: true, type: 'penalty_alert', priority: 'critical' },\n  'red_card': { notify: true, type: 'red_card_alert', priority: 'high' },\n  'second_yellow': { notify: true, type: 'second_yellow_alert', priority: 'high' },\n  'var_overturned': { notify: true, type: 'var_alert', priority: 'high' },\n  'yellow_card': { notify: false },\n  'substitution': { notify: false },\n  'var_review': { notify: false },\n  'kick_off': { notify: false },\n  'half_time': { notify: false },\n  'full_time': { notify: false },\n};\n\nconst config = NOTIFY_TYPES[evt.event_type] || { notify: false };\n\nreturn [{\n  json: {\n    should_notify: config.notify && wasInserted,\n    was_inserted: wasInserted,\n    notification_type: config.type || null,\n    notification_priority: config.priority || 'low',\n    event: evt,\n  }\n}];\n"
+      },
+      "id": "node-should-notify",
+      "name": "Should Notify?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 560]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "notify-check",
+              "leftValue": "={{ $json.should_notify }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-notify-if",
+      "name": "Notify?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3980, 560]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  m.id::text AS match_id,\n  ht.name AS home_team, ht.short_name AS home_code,\n  at.name AS away_team, at.short_name AS away_code,\n  v.name AS venue_name,\n  m.home_score, m.away_score\nFROM wcic.matches m\nJOIN wcic.teams ht ON ht.id = m.home_team_id\nJOIN wcic.teams at ON at.id = m.away_team_id\nLEFT JOIN wcic.venues v ON v.id = m.venue_id\nWHERE m.id = $1::uuid\nLIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ [$json.event.matchId] }}"
+        },
+        "options": {}
+      },
+      "id": "node-fetch-match-context",
+      "name": "Fetch Match Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4200, 460],
+      "credentials": {
+        "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Build Notification Payload\n// Monta o payload padrão do WF-07\n// ============================================================\nconst notifyData = $('Should Notify?').item.json;\nconst evt = notifyData.event;\nconst matchCtx = $input.first().json;\n\nconst homeScore = evt.homeScore ?? matchCtx.home_score ?? 0;\nconst awayScore = evt.awayScore ?? matchCtx.away_score ?? 0;\n\nconst payload = {\n  type: notifyData.notification_type,\n  priority: notifyData.notification_priority,\n  channel: 'telegram',\n  match_id: evt.matchId,\n  event_type: evt.event_type,\n  event_minute: evt.minute,\n  correlation_id: evt.correlationId,\n  content: {\n    title: `${notifyData.notification_type.replace('_', ' ').toUpperCase()} - ${matchCtx.home_team || '?'} vs ${matchCtx.away_team || '?'}`,\n    body: '',  // gerado pelo WF-07 Format Message node\n    metadata: {\n      caller_workflow: 'WF-02-live-event-monitor',\n      home_team: matchCtx.home_team || '?',\n      away_team: matchCtx.away_team || '?',\n      home_code: matchCtx.home_code || '',\n      away_code: matchCtx.away_code || '',\n      home_score: homeScore,\n      away_score: awayScore,\n      minute: evt.minute,\n      scorer: evt.player_name || null,\n      assist: evt.assist_player_name || null,\n      player: evt.player_name || null,\n      team: matchCtx.home_team || '?',\n      detail: evt.detail || null,\n      venue: matchCtx.venue_name || null,\n    }\n  }\n};\n\nreturn [{ json: payload }];\n"
+      },
+      "id": "node-build-notification",
+      "name": "Build Notification Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4420, 460]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "WF-07 - Notification Hub", "mode": "name" },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "node-call-wf07",
+      "name": "Call WF-07",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [4640, 460]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (\n  execution_id, workflow_name, status, started_at, finished_at,\n  duration_ms, trigger_type, correlation_id, items_processed, output_summary\n) VALUES (\n  $1, 'WF-02-live-event-monitor', 'success', $2::timestamptz, NOW(),\n  EXTRACT(EPOCH FROM (NOW() - $2::timestamptz)) * 1000,\n  'cron', $3::uuid, $4,\n  $5::jsonb\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $('Init').first().json.executionId,\n  $('Init').first().json.startedAt,\n  $('Init').first().json.correlationId,\n  $('Check Active Matches').first().json.activeCount || 0,\n  JSON.stringify({ active_matches: $('Check Active Matches').first().json.activeCount || 0 })\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4860, 560],
+      "credentials": {
+        "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (60s)": {
+      "main": [[{ "node": "Init", "type": "main", "index": 0 }]]
+    },
+    "Init": {
+      "main": [[{ "node": "Get Active Matches", "type": "main", "index": 0 }]]
+    },
+    "Get Active Matches": {
+      "main": [[{ "node": "Check Active Matches", "type": "main", "index": 0 }]]
+    },
+    "Check Active Matches": {
+      "main": [[{ "node": "Has Active Matches?", "type": "main", "index": 0 }]]
+    },
+    "Has Active Matches?": {
+      "main": [
+        [{ "node": "Log No Active Matches", "type": "main", "index": 0 }],
+        [{ "node": "Expand Match IDs", "type": "main", "index": 0 }]
+      ]
+    },
+    "Expand Match IDs": {
+      "main": [[{ "node": "Split in Batches (5)", "type": "main", "index": 0 }]]
+    },
+    "Split in Batches (5)": {
+      "main": [[{ "node": "Get Event Cursor", "type": "main", "index": 0 }]]
+    },
+    "Get Event Cursor": {
+      "main": [[{ "node": "Prepare API Call", "type": "main", "index": 0 }]]
+    },
+    "Prepare API Call": {
+      "main": [[{ "node": "Fetch Match Events", "type": "main", "index": 0 }]]
+    },
+    "Fetch Match Events": {
+      "main": [
+        [{ "node": "Parse & Filter Events", "type": "main", "index": 0 }],
+        [{ "node": "Handle API Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Handle API Error": {
+      "main": [[{ "node": "Increment Error Count", "type": "main", "index": 0 }]]
+    },
+    "Increment Error Count": {
+      "main": [[{ "node": "Set Error TTL", "type": "main", "index": 0 }]]
+    },
+    "Set Error TTL": {
+      "main": [[{ "node": "3+ Errors?", "type": "main", "index": 0 }]]
+    },
+    "3+ Errors?": {
+      "main": [
+        [{ "node": "Remove from Active (Error)", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Parse & Filter Events": {
+      "main": [[{ "node": "Update Cursor", "type": "main", "index": 0 }]]
+    },
+    "Update Cursor": {
+      "main": [[{ "node": "Has New Events?", "type": "main", "index": 0 }]]
+    },
+    "Has New Events?": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Expand Events", "type": "main", "index": 0 }]
+      ]
+    },
+    "Expand Events": {
+      "main": [[{ "node": "Insert Event", "type": "main", "index": 0 }]]
+    },
+    "Insert Event": {
+      "main": [[{ "node": "Publish Event", "type": "main", "index": 0 }]]
+    },
+    "Publish Event": {
+      "main": [[{ "node": "Should Notify?", "type": "main", "index": 0 }]]
+    },
+    "Should Notify?": {
+      "main": [[{ "node": "Notify?", "type": "main", "index": 0 }]]
+    },
+    "Notify?": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Fetch Match Context", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Match Context": {
+      "main": [[{ "node": "Build Notification Payload", "type": "main", "index": 0 }]]
+    },
+    "Build Notification Payload": {
+      "main": [[{ "node": "Call WF-07", "type": "main", "index": 0 }]]
+    },
+    "Call WF-07": {
+      "main": [[{ "node": "Log Success", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [
+    { "id": "tag-sprint3", "name": "sprint-3" },
+    { "id": "tag-live-events", "name": "live-events" }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf02-v1-0-0"
+}
