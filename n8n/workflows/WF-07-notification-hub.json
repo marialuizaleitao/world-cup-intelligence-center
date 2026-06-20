@@ -1,0 +1,391 @@
+{
+  "name": "WF-07 - Notification Hub",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-wf-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Validate Payload\n// Garante que os campos obrigatórios estão presentes e corretos\n// ============================================================\nconst input = $input.first().json;\n\nconst REQUIRED = ['type', 'priority', 'channel', 'correlation_id', 'content'];\nconst VALID_TYPES = ['goal_alert','own_goal_alert','penalty_alert','red_card_alert','second_yellow_alert','var_alert','match_start','match_end','match_halftime','operational_alert'];\nconst VALID_PRIORITIES = ['critical','high','medium','low'];\nconst VALID_CHANNELS = ['telegram','slack','email','webhook'];\n\nconst missing = REQUIRED.filter(f => !input[f]);\nif (missing.length > 0) {\n  throw new Error(`WF-07 payload inválido - campos ausentes: ${missing.join(', ')}`);\n}\n\nif (!VALID_TYPES.includes(input.type)) {\n  throw new Error(`WF-07 tipo inválido: '${input.type}'. Válidos: ${VALID_TYPES.join(',')}`);\n}\nif (!VALID_PRIORITIES.includes(input.priority)) {\n  throw new Error(`WF-07 prioridade inválida: '${input.priority}'`);\n}\nif (!VALID_CHANNELS.includes(input.channel)) {\n  throw new Error(`WF-07 canal inválido: '${input.channel}'`);\n}\nif (!input.content?.body) {\n  throw new Error('WF-07 content.body é obrigatório');\n}\n\n// Gera event_dedup_key para eventos ao vivo (previne duplicatas mesmo com retry)\nlet eventDedupKey = null;\nif (input.match_id && input.event_type && input.event_minute !== undefined) {\n  const raw = `${input.match_id}|${input.event_type}|${input.event_minute}|${input.channel}`;\n  // Hash simples compatível com n8n sem crypto nativo acessível aqui\n  // O hash real é calculado no node seguinte com Buffer\n  eventDedupKey = Buffer.from(raw).toString('base64').substring(0, 128);\n}\n\nreturn [{\n  json: {\n    ...input,\n    event_dedup_key: eventDedupKey,\n    validated_at: new Date().toISOString(),\n    execution_id: $execution.id,\n  }\n}];\n"
+      },
+      "id": "node-validate",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ `wcic:rl:notify:${$json.channel}:${$json.correlation_id}` }}"
+      },
+      "id": "node-check-rate-limit",
+      "name": "Check Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Rate Limit Decision\n// Bloqueia notificações duplicadas por correlation_id no mesmo canal\n// TTL de 60s para eventos críticos, 300s para medium/low\n// ============================================================\nconst cacheResult = $input.first().json;\nconst payload = $('Validate Payload').first().json;\n\n// Se a chave existe no Redis, já foi enviada recentemente\nif (cacheResult.value) {\n  return [{ json: { blocked: true, reason: 'rate_limited', payload } }];\n}\n\nreturn [{ json: { blocked: false, payload } }];\n"
+      },
+      "id": "node-rate-limit-decision",
+      "name": "Rate Limit Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "blocked-check",
+              "leftValue": "={{ $json.blocked }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-is-blocked",
+      "name": "Is Rate Limited?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node executado quando rate limited - apenas loga e para\nconst { payload } = $input.first().json;\nconsole.log(`[WF-07] Rate limited: ${payload.type} channel=${payload.channel} correlation=${payload.correlation_id}`);\nreturn [];\n"
+      },
+      "id": "node-rate-limited-stop",
+      "name": "Log Rate Limited",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Format Message\n// Gera o texto final da notificação com base no tipo de evento\n// Todos os templates são definidos aqui - um único lugar para manutenção\n// ============================================================\nconst { payload } = $input.first().json;\nconst c = payload.content;\nconst meta = c.metadata || {};\n\nconst FLAG_MAP = {\n  'BRA': '????', 'ARG': '????', 'FRA': '????', 'ENG': '????',\n  'ESP': '????', 'GER': '????', 'POR': '????', 'NED': '????',\n  'ITA': '????', 'BEL': '????', 'URU': '????', 'COL': '????',\n  'MEX': '????', 'USA': '????', 'JPN': '????', 'KOR': '????',\n  'MAR': '????', 'SEN': '????', 'GHA': '????', 'EGY': '????',\n  'CRO': '????', 'SRB': '????', 'DEN': '????', 'SUI': '????',\n  'POL': '????', 'UKR': '????', 'WAL': '????', 'CAN': '????',\n};\n\nconst homeFlag = FLAG_MAP[meta.home_code] || '???';\nconst awayFlag = FLAG_MAP[meta.away_code] || '???';\nconst scoreLine = meta.home_team ? `${homeFlag} *${meta.home_team}* ${meta.home_score ?? 0}–${meta.away_score ?? 0} *${meta.away_team}* ${awayFlag}` : '';\n\nlet formattedBody = '';\n\nswitch (payload.type) {\n\n  case 'goal_alert':\n    formattedBody = [\n      `? *GOL!* - ${meta.minute}'`,\n      scoreLine,\n      ``,\n      `?? *${meta.scorer || 'Jogador desconhecido'}*`,\n      meta.assist ? `?? Assistência: ${meta.assist}` : null,\n      meta.detail ? `?? ${meta.detail}` : null,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}${meta.away_code ? ` #${meta.away_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'own_goal_alert':\n    formattedBody = [\n      `?? *GOL CONTRA!* - ${meta.minute}'`,\n      scoreLine,\n      ``,\n      `?? *${meta.scorer || 'Jogador desconhecido'}* (gol contra)`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'penalty_alert':\n    formattedBody = [\n      `?? *PÊNALTI CONVERTIDO!* - ${meta.minute}'`,\n      scoreLine,\n      ``,\n      `? *${meta.scorer || 'Jogador desconhecido'}*`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'red_card_alert':\n    formattedBody = [\n      `?? *CARTÃO VERMELHO!* - ${meta.minute}'`,\n      scoreLine,\n      ``,\n      `? *${meta.player || 'Jogador desconhecido'}* (${meta.team || '?'})`,\n      meta.detail ? `?? ${meta.detail}` : null,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'second_yellow_alert':\n    formattedBody = [\n      `???? *SEGUNDO AMARELO!* - ${meta.minute}'`,\n      scoreLine,\n      ``,\n      `? *${meta.player || 'Jogador desconhecido'}* (${meta.team || '?'}) expulso`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'var_alert':\n    formattedBody = [\n      `?? *VAR REVISÃO* - ${meta.minute}'`,\n      scoreLine,\n      ``,\n      `?? ${meta.detail || 'Decisão em análise pelo VAR'}`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'match_start':\n    formattedBody = [\n      `?? *INÍCIO DE JOGO!*`,\n      scoreLine || `${homeFlag} ${meta.home_team || '?'} vs ${meta.away_team || '?'} ${awayFlag}`,\n      ``,\n      `??? ${meta.venue || 'Estádio não informado'}`,\n      `?? Horário local: ${meta.local_time || '?'}`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}${meta.away_code ? ` #${meta.away_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'match_halftime':\n    formattedBody = [\n      `?? *INTERVALO*`,\n      scoreLine,\n      ``,\n      `?? Placar no intervalo: ${meta.home_score_ht ?? 0}–${meta.away_score_ht ?? 0}`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'match_end':\n    formattedBody = [\n      `?? *FIM DE JOGO!*`,\n      scoreLine,\n      ``,\n      meta.winner ? `?? Vencedor: *${meta.winner}*` : `?? *Empate*`,\n      ``,\n      `#Copa2026${meta.home_code ? ` #${meta.home_code}` : ''}${meta.away_code ? ` #${meta.away_code}` : ''}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  case 'operational_alert':\n    formattedBody = [\n      `?? *ALERTA OPERACIONAL*`,\n      ``,\n      c.title ? `*${c.title}*` : null,\n      c.body,\n      ``,\n      `?? ${new Date().toISOString()}`,\n    ].filter(Boolean).join('\\n');\n    break;\n\n  default:\n    formattedBody = c.body;\n}\n\nreturn [{\n  json: {\n    ...payload,\n    formatted_body: formattedBody,\n  }\n}];\n"
+      },
+      "id": "node-format-message",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 540]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "options": { "caseSensitive": true }, "conditions": [{ "leftValue": "={{ $json.channel }}", "rightValue": "telegram", "operator": { "type": "string", "operation": "equals" } }] }, "renameOutput": true, "outputKey": "telegram" },
+            { "conditions": { "options": { "caseSensitive": true }, "conditions": [{ "leftValue": "={{ $json.channel }}", "rightValue": "slack", "operator": { "type": "string", "operation": "equals" } }] }, "renameOutput": true, "outputKey": "slack" },
+            { "conditions": { "options": { "caseSensitive": true }, "conditions": [{ "leftValue": "={{ $json.channel }}", "rightValue": "email", "operator": { "type": "string", "operation": "equals" } }] }, "renameOutput": true, "outputKey": "email" },
+            { "conditions": { "options": { "caseSensitive": true }, "conditions": [{ "leftValue": "={{ $json.channel }}", "rightValue": "webhook", "operator": { "type": "string", "operation": "equals" } }] }, "renameOutput": true, "outputKey": "webhook" }
+          ]
+        },
+        "options": { "fallbackOutput": "none" }
+      },
+      "id": "node-route-channel",
+      "name": "Route by Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1560, 540]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.content?.metadata?.chat_id || $('Format Message').first().json.content?.metadata?.chat_id || $env.TELEGRAM_LIVE_CHAT_ID }}",
+        "text": "={{ $json.formatted_body }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "node-send-telegram",
+      "name": "Send Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1780, 380],
+      "credentials": {
+        "telegramApi": {
+          "id": "cred-telegram",
+          "name": "WCIC Telegram Bot"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{ $json.formatted_body }}"
+            }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-send-slack",
+      "name": "Send Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 540],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.content?.metadata?.webhook_url }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ type: $json.type, priority: $json.priority, content: $json.formatted_body, match_id: $json.match_id, correlation_id: $json.correlation_id, timestamp: new Date().toISOString() }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "node-send-webhook",
+      "name": "Send Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 700],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Evaluate Send Result\n// Consolida o resultado do envio (sucesso ou erro) em formato\n// padronizado para o node de persistência\n// ============================================================\nconst input = $input.first();\nconst payload = $('Format Message').first().json;\n\n// n8n coloca erros no output de erro - se chegou aqui, foi sucesso\nconst success = !input.json?.error;\nconst errorMessage = input.json?.error?.message || null;\n\nreturn [{\n  json: {\n    payload,\n    send_success: success,\n    send_error: errorMessage,\n    sent_at: success ? new Date().toISOString() : null,\n  }\n}];\n"
+      },
+      "id": "node-eval-result",
+      "name": "Evaluate Send Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 540]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.notifications (\n  notification_type, priority, channel, recipient,\n  subject, body, metadata, status,\n  attempts, max_attempts, sent_at, error_message,\n  related_match_id, correlation_id, workflow_execution_id,\n  event_dedup_key\n) VALUES (\n  $1, $2::wcic.notification_priority, $3::wcic.notification_channel, $4,\n  $5, $6, $7::jsonb, $8::wcic.notification_status,\n  1, 3, $9::timestamptz, $10,\n  $11::uuid, $12::uuid, $13,\n  $14\n)\nON CONFLICT (event_dedup_key)\nWHERE event_dedup_key IS NOT NULL\nDO UPDATE SET\n  attempts = notifications.attempts + 1,\n  error_message = EXCLUDED.error_message,\n  status = CASE\n    WHEN EXCLUDED.status = 'sent' THEN 'sent'::wcic.notification_status\n    WHEN notifications.attempts >= notifications.max_attempts THEN 'failed'::wcic.notification_status\n    ELSE 'retry'::wcic.notification_status\n  END\nRETURNING id::text, status, attempts;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.payload.type,\n  $json.payload.priority,\n  $json.payload.channel,\n  $json.payload.content?.metadata?.chat_id || $json.payload.channel,\n  $json.payload.content?.title || null,\n  $json.payload.formatted_body,\n  JSON.stringify($json.payload.content?.metadata || {}),\n  $json.send_success ? 'sent' : 'failed',\n  $json.sent_at || null,\n  $json.send_error || null,\n  $json.payload.match_id || null,\n  $json.payload.correlation_id,\n  $json.payload.execution_id || null,\n  $json.payload.event_dedup_key || null\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-persist-notification",
+      "name": "Persist Notification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2220, 540],
+      "credentials": {
+        "postgres": {
+          "id": "cred-postgres",
+          "name": "WCIC PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Set Rate Limit Key\n// Só define a chave de rate limit APÓS persistência bem-sucedida\n// TTL varia por prioridade:\n//   critical/high ? 60s (um por minuto no mesmo canal+correlation)\n//   medium ? 300s\n//   low ? 600s\n// ============================================================\nconst result = $input.first().json;\nconst payload = $('Format Message').first().json;\n\nconst TTL_MAP = {\n  critical: 60,\n  high: 60,\n  medium: 300,\n  low: 600,\n};\n\nconst ttl = TTL_MAP[payload.priority] || 60;\n\nreturn [{\n  json: {\n    rate_limit_key: `wcic:rl:notify:${payload.channel}:${payload.correlation_id}`,\n    rate_limit_ttl: ttl,\n    notification_id: result.id,\n    notification_status: result.status,\n  }\n}];\n"
+      },
+      "id": "node-prepare-rate-limit",
+      "name": "Prepare Rate Limit Key",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 540]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ $json.rate_limit_key }}",
+        "value": "1",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": "={{ $json.rate_limit_ttl }}"
+      },
+      "id": "node-set-rate-limit",
+      "name": "Set Rate Limit Key",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2660, 540],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "failed-check",
+              "leftValue": "={{ $('Evaluate Send Result').first().json.send_success }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "false" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-check-retry",
+      "name": "Send Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2880, 540]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Schedule Retry\n// Notificações críticas/high são colocadas numa fila Redis\n// para reprocessamento pelo WF-10 (Error Recovery)\n// medium/low são apenas logadas como falha\n// ============================================================\nconst evalResult = $('Evaluate Send Result').first().json;\nconst payload = evalResult.payload;\n\nconst retryPayload = {\n  original_payload: payload,\n  failure_reason: evalResult.send_error,\n  failed_at: new Date().toISOString(),\n  retry_count: 1,\n};\n\n// Só enfileira para retry se for alta prioridade\nconst shouldRetry = ['critical', 'high'].includes(payload.priority);\n\nreturn [{ json: { ...retryPayload, should_retry: shouldRetry } }];\n"
+      },
+      "id": "node-schedule-retry",
+      "name": "Prepare Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 440]
+    },
+    {
+      "parameters": {
+        "operation": "rpush",
+        "key": "=wcic:queue:dlq:wf07",
+        "value": "={{ JSON.stringify($json.original_payload) }}"
+      },
+      "id": "node-push-dlq",
+      "name": "Push to DLQ",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3320, 380],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (\n  execution_id, workflow_name, status, started_at,\n  finished_at, duration_ms, trigger_type, triggered_by,\n  correlation_id, items_processed, output_summary\n) VALUES (\n  $1, 'WF-07-notification-hub', $2::wcic.workflow_status, $3::timestamptz,\n  NOW(),\n  EXTRACT(EPOCH FROM (NOW() - $3::timestamptz)) * 1000,\n  'sub-workflow', $4, $5::uuid, 1,\n  $6::jsonb\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $('Validate Payload').first().json.execution_id,\n  $('Evaluate Send Result').first().json.send_success ? 'success' : 'error',\n  $('Validate Payload').first().json.validated_at,\n  $('Validate Payload').first().json.content?.metadata?.caller_workflow || 'unknown',\n  $('Validate Payload').first().json.correlation_id,\n  JSON.stringify({\n    type: $('Validate Payload').first().json.type,\n    channel: $('Validate Payload').first().json.channel,\n    priority: $('Validate Payload').first().json.priority,\n    send_success: $('Evaluate Send Result').first().json.send_success\n  })\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-execution",
+      "name": "Log Execution",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3100, 660],
+      "credentials": {
+        "postgres": {
+          "id": "cred-postgres",
+          "name": "WCIC PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Validate Payload", "type": "main", "index": 0 }]]
+    },
+    "Validate Payload": {
+      "main": [[{ "node": "Check Rate Limit", "type": "main", "index": 0 }]]
+    },
+    "Check Rate Limit": {
+      "main": [[{ "node": "Rate Limit Decision", "type": "main", "index": 0 }]]
+    },
+    "Rate Limit Decision": {
+      "main": [[{ "node": "Is Rate Limited?", "type": "main", "index": 0 }]]
+    },
+    "Is Rate Limited?": {
+      "main": [
+        [{ "node": "Log Rate Limited", "type": "main", "index": 0 }],
+        [{ "node": "Format Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Message": {
+      "main": [[{ "node": "Route by Channel", "type": "main", "index": 0 }]]
+    },
+    "Route by Channel": {
+      "main": [
+        [{ "node": "Send Telegram", "type": "main", "index": 0 }],
+        [{ "node": "Send Slack", "type": "main", "index": 0 }],
+        [],
+        [{ "node": "Send Webhook", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Telegram": {
+      "main": [
+        [{ "node": "Evaluate Send Result", "type": "main", "index": 0 }],
+        [{ "node": "Evaluate Send Result", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Slack": {
+      "main": [
+        [{ "node": "Evaluate Send Result", "type": "main", "index": 0 }],
+        [{ "node": "Evaluate Send Result", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Webhook": {
+      "main": [
+        [{ "node": "Evaluate Send Result", "type": "main", "index": 0 }],
+        [{ "node": "Evaluate Send Result", "type": "main", "index": 0 }]
+      ]
+    },
+    "Evaluate Send Result": {
+      "main": [[{ "node": "Persist Notification", "type": "main", "index": 0 }]]
+    },
+    "Persist Notification": {
+      "main": [[{ "node": "Prepare Rate Limit Key", "type": "main", "index": 0 }]]
+    },
+    "Prepare Rate Limit Key": {
+      "main": [[{ "node": "Set Rate Limit Key", "type": "main", "index": 0 }]]
+    },
+    "Set Rate Limit Key": {
+      "main": [[{ "node": "Send Failed?", "type": "main", "index": 0 }]]
+    },
+    "Send Failed?": {
+      "main": [
+        [{ "node": "Prepare Retry", "type": "main", "index": 0 }],
+        [{ "node": "Log Execution", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare Retry": {
+      "main": [[{ "node": "Push to DLQ", "type": "main", "index": 0 }]]
+    },
+    "Push to DLQ": {
+      "main": [[{ "node": "Log Execution", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [
+    { "id": "tag-sprint3", "name": "sprint-3" },
+    { "id": "tag-notifications", "name": "notifications" }
+  ],
+  "triggerCount": 0,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf07-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/workflows/WF-07-notification-hub.json')); print(f'WF-07: {len(d[\"nodes\"])} nodes, {len(d[\"connections\"])} connections - JSON válido')"
