@@ -1,0 +1,823 @@
+{
+  "name": "WF-01 - Match Collector",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "node-schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Init\n// Gera correlation_id, registra início da execução no PostgreSQL\n// ============================================================\nconst { v4: uuidv4 } = require('uuid');\n\nconst correlationId = uuidv4();\nconst startedAt = new Date().toISOString();\nconst executionId = $execution.id;\n\n// Persiste início da execução — será atualizado ao final\n// A query real é feita no node PostgreSQL subsequente\n// Aqui apenas preparamos os metadados\nreturn [{\n  json: {\n    correlationId,\n    startedAt,\n    executionId,\n    workflowName: 'WF-01-match-collector',\n    circuitBreakerKey: 'wcic:circuit:wf01:football-data',\n    errorCounterKey: 'wcic:errors:wf01:football-data',\n    teamIdMapCacheKey: 'wcic:cache:team-id-map',\n    activeMatchesKey: 'wcic:active_matches'\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ $json.correlationId }}",
+        "value": "={{ JSON.stringify({ executionId: $json.executionId, workflowName: $json.workflowName, startedAt: $json.startedAt }) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 3600
+      },
+      "id": "node-log-start",
+      "name": "Log Start to Redis",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wcic:circuit:wf01:football-data"
+      },
+      "id": "node-check-circuit",
+      "name": "Check Circuit Breaker",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "circuit-open-check",
+              "leftValue": "={{ $json.value }}",
+              "rightValue": "OPEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-circuit-if",
+      "name": "Circuit Open?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.football-data.org/v4/competitions/WC/matches",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "season",
+              "value": "2026"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "node-fetch-primary",
+      "name": "Fetch Football-Data API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1360, 180],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cred-football-data",
+          "name": "Football Data API"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://api-football-v1.p.rapidapi.com/v3/fixtures",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "league",
+              "value": "1"
+            },
+            {
+              "name": "season",
+              "value": "2026"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-RapidAPI-Host",
+              "value": "api-football-v1.p.rapidapi.com"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-fetch-fallback",
+      "name": "Fetch RapidAPI (Fallback)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1360, 420],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "cred-rapidapi",
+          "name": "RapidAPI Football"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Handle Primary API Error\n// Incrementa contador de erros e decide entre fallback ou circuit open\n// ============================================================\nconst errorCounterKey = 'wcic:errors:wf01:football-data';\nconst circuitKey = 'wcic:circuit:wf01:football-data';\n\n// O valor do contador será lido no próximo node Redis\n// Aqui apenas preparamos o contexto para a decisão\nconst errorData = $input.first().json;\n\nreturn [{\n  json: {\n    ...$('Init').first().json,\n    errorCounterKey,\n    circuitKey,\n    apiError: errorData.error || 'HTTP error from Football-Data API',\n    timestamp: new Date().toISOString()\n  }\n}];\n"
+      },
+      "id": "node-handle-primary-error",
+      "name": "Handle Primary Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1580, 180]
+    },
+    {
+      "parameters": {
+        "operation": "incr",
+        "key": "=wcic:errors:wf01:football-data"
+      },
+      "id": "node-incr-errors",
+      "name": "Increment Error Counter",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1800, 180],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "=wcic:errors:wf01:football-data",
+        "ttl": 600
+      },
+      "id": "node-set-error-ttl",
+      "name": "Set Error Counter TTL",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2020, 180],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "threshold-check",
+              "leftValue": "={{ $json.value }}",
+              "rightValue": 5,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-circuit-threshold",
+      "name": "Error Threshold Reached?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2240, 180]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=wcic:circuit:wf01:football-data",
+        "value": "OPEN",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 600
+      },
+      "id": "node-open-circuit",
+      "name": "Open Circuit Breaker",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2460, 120],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Normalize Payload\n// Converte resposta da API (Football-Data ou RapidAPI) para\n// o schema wcic.matches. Suporta ambos os formatos.\n// ============================================================\n\nconst initData = $('Init').first().json;\nconst apiResponse = $input.first().json;\n\n// Detecta qual API respondeu pelo formato\nconst isFootballData = apiResponse.body?.matches !== undefined || apiResponse.matches !== undefined;\nconst isRapidApi = apiResponse.response !== undefined;\n\nconst STATUS_MAP_FD = {\n  'SCHEDULED':   'scheduled',\n  'TIMED':       'scheduled',\n  'IN_PLAY':     'live',\n  'PAUSED':      'halftime',\n  'FINISHED':    'finished',\n  'POSTPONED':   'postponed',\n  'CANCELLED':   'cancelled',\n  'SUSPENDED':   'suspended',\n};\n\nconst STATUS_MAP_RA = {\n  'NS':    'scheduled',  // Not Started\n  '1H':   'live',        // First Half\n  'HT':   'halftime',    // Half Time\n  '2H':   'live',        // Second Half\n  'ET':   'live',        // Extra Time\n  'P':    'live',        // Penalty in Progress\n  'FT':   'finished',    // Full Time\n  'AET':  'finished',    // After Extra Time\n  'PEN':  'finished',    // After Penalties\n  'SUSP': 'suspended',\n  'PST':  'postponed',\n  'CANC': 'cancelled',\n};\n\nconst STAGE_MAP_FD = {\n  'GROUP_STAGE':    (m) => `group_${(m.group || 'Group A').replace('Group ', '').toLowerCase()}`,\n  'LAST_32':        () => 'round_of_32',\n  'LAST_16':        () => 'round_of_16',\n  'QUARTER_FINALS': () => 'quarter_final',\n  'SEMI_FINALS':    () => 'semi_final',\n  'THIRD_PLACE':    () => 'third_place',\n  'FINAL':          () => 'final',\n};\n\nlet rawMatches = [];\nlet sourceApi = 'football-data';\n\nif (isFootballData) {\n  const body = apiResponse.body || apiResponse;\n  rawMatches = body.matches || [];\n  sourceApi = 'football-data';\n} else if (isRapidApi) {\n  rawMatches = apiResponse.response || [];\n  sourceApi = 'rapidapi';\n}\n\nif (rawMatches.length === 0) {\n  return [{ json: { matches: [], sourceApi, correlationId: initData.correlationId, totalMatches: 0 } }];\n}\n\nconst normalizedMatches = [];\nconst errors = [];\n\nfor (const raw of rawMatches) {\n  try {\n    let match;\n    \n    if (sourceApi === 'football-data') {\n      const stageResolver = STAGE_MAP_FD[raw.stage];\n      if (!stageResolver) {\n        errors.push({ external_id: raw.id, error: `Unknown stage: ${raw.stage}` });\n        continue;\n      }\n      match = {\n        external_id:    String(raw.id),\n        external_home_id: String(raw.homeTeam.id),\n        external_away_id: String(raw.awayTeam.id),\n        stage:          stageResolver(raw),\n        scheduled_at:   raw.utcDate,\n        status:         STATUS_MAP_FD[raw.status] || 'scheduled',\n        home_score:     raw.score?.fullTime?.home ?? null,\n        away_score:     raw.score?.fullTime?.away ?? null,\n        home_score_ht:  raw.score?.halfTime?.home ?? null,\n        away_score_ht:  raw.score?.halfTime?.away ?? null,\n        referee:        raw.referees?.[0]?.name ?? null,\n        source_api:     'football-data',\n        raw_payload:    raw,\n        // winner resolvido pelo node PostgreSQL com base nos IDs internos\n        score_winner:   raw.score?.winner ?? null,\n      };\n    } else {\n      // RapidAPI format\n      const fixture = raw.fixture || raw;\n      const league = raw.league || {};\n      const teams = raw.teams || {};\n      const goals = raw.goals || {};\n      const score = raw.score || {};\n      \n      const stageRaw = league.round || 'Group Stage';\n      let stage = 'group_a';\n      if (stageRaw.toLowerCase().includes('group')) {\n        const letter = (stageRaw.match(/group\\s+([a-l])/i) || [])[1] || 'a';\n        stage = `group_${letter.toLowerCase()}`;\n      } else if (stageRaw.includes('Round of 32')) stage = 'round_of_32';\n      else if (stageRaw.includes('Round of 16')) stage = 'round_of_16';\n      else if (stageRaw.includes('Quarter')) stage = 'quarter_final';\n      else if (stageRaw.includes('Semi')) stage = 'semi_final';\n      else if (stageRaw.includes('3rd')) stage = 'third_place';\n      else if (stageRaw.includes('Final')) stage = 'final';\n      \n      match = {\n        external_id:     String(fixture.id),\n        external_home_id: String(teams.home?.id),\n        external_away_id: String(teams.away?.id),\n        stage,\n        scheduled_at:    fixture.date,\n        status:          STATUS_MAP_RA[fixture.status?.short] || 'scheduled',\n        home_score:      goals.home ?? null,\n        away_score:      goals.away ?? null,\n        home_score_ht:   score.halftime?.home ?? null,\n        away_score_ht:   score.halftime?.away ?? null,\n        referee:         fixture.referee ?? null,\n        source_api:      'rapidapi',\n        raw_payload:     raw,\n        score_winner:    null,\n      };\n    }\n    \n    normalizedMatches.push(match);\n  } catch (err) {\n    errors.push({ error: err.message, raw_id: raw.id || raw.fixture?.id });\n  }\n}\n\nreturn [{\n  json: {\n    matches: normalizedMatches,\n    errors,\n    sourceApi,\n    correlationId: initData.correlationId,\n    totalMatches: normalizedMatches.length,\n    totalErrors: errors.length,\n  }\n}];\n"
+      },
+      "id": "node-normalize",
+      "name": "Normalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 420]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=wcic:errors:wf01:football-data"
+      },
+      "id": "node-reset-errors",
+      "name": "Reset Error Counter",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1580, 420],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wcic:cache:team-id-map"
+      },
+      "id": "node-get-team-map",
+      "name": "Get Team ID Map from Cache",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2020, 420],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Resolve Team IDs\n// Mapeia external_id da API para UUID interno do PostgreSQL\n// Usa cache Redis; se ausente, faz query no banco\n// ============================================================\n\nconst normalizeData = $('Normalize Payload').first().json;\nconst cacheResult = $input.first().json;\n\nlet teamIdMap = {};\n\nif (cacheResult.value) {\n  try {\n    teamIdMap = JSON.parse(cacheResult.value);\n  } catch (e) {\n    // Cache corrompido — será reconstruído via banco\n    teamIdMap = {};\n  }\n}\n\n// Se o mapa não está no cache, será populado pelo node PostgreSQL\n// que busca todos os times com external_id\nconst needsDbFetch = Object.keys(teamIdMap).length === 0;\n\nreturn [{\n  json: {\n    ...normalizeData,\n    teamIdMap,\n    needsDbFetch,\n  }\n}];\n"
+      },
+      "id": "node-resolve-teams",
+      "name": "Resolve Team IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "needs-db-check",
+              "leftValue": "={{ $json.needsDbFetch }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-needs-db-fetch",
+      "name": "Needs DB Fetch?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2460, 420]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT external_id, id::text as internal_id FROM wcic.teams WHERE external_id IS NOT NULL;",
+        "options": {}
+      },
+      "id": "node-fetch-team-ids",
+      "name": "Fetch Team IDs from DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2680, 360],
+      "credentials": {
+        "postgres": {
+          "id": "cred-postgres",
+          "name": "WCIC PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Build Team Map from DB\n// Constrói o mapa external_id ? UUID e salva no Redis\n// ============================================================\n\nconst dbRows = $input.all();\nconst resolveData = $('Resolve Team IDs').first().json;\n\nconst teamIdMap = {};\nfor (const row of dbRows) {\n  if (row.json.external_id) {\n    teamIdMap[row.json.external_id] = row.json.internal_id;\n  }\n}\n\nreturn [{\n  json: {\n    ...resolveData,\n    teamIdMap,\n    needsDbFetch: false,\n  }\n}];\n"
+      },
+      "id": "node-build-team-map",
+      "name": "Build Team Map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2900, 360]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=wcic:cache:team-id-map",
+        "value": "={{ JSON.stringify($json.teamIdMap) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 86400
+      },
+      "id": "node-cache-team-map",
+      "name": "Cache Team Map (24h)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3120, 360],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Prepare Matches for Batch\n// Aplica teamIdMap às partidas normalizadas e filtra inválidas\n// Converte array de matches em itens individuais para SplitInBatches\n// ============================================================\n\n// Dados chegam de dois caminhos: com DB fetch ou sem\n// Pegamos o teamIdMap do nó mais recente disponível\nlet sourceData;\ntry {\n  sourceData = $('Cache Team Map (24h)').first().json;\n} catch(e) {\n  sourceData = $('Resolve Team IDs').first().json;\n}\n\nconst { matches, teamIdMap, correlationId } = sourceData;\n\nif (!matches || matches.length === 0) {\n  return [{ json: { skip: true, reason: 'no matches to process', correlationId } }];\n}\n\nconst prepared = [];\nconst skipped = [];\n\nfor (const match of matches) {\n  const homeId = teamIdMap[match.external_home_id];\n  const awayId = teamIdMap[match.external_away_id];\n  \n  if (!homeId || !awayId) {\n    skipped.push({\n      external_id: match.external_id,\n      reason: `Team not found: home=${match.external_home_id}, away=${match.external_away_id}`\n    });\n    continue;\n  }\n  \n  prepared.push({\n    ...match,\n    home_team_id: homeId,\n    away_team_id: awayId,\n    correlationId,\n  });\n}\n\n// Retorna cada partida como item separado para o SplitInBatches\nreturn prepared.map(m => ({ json: m }));\n"
+      },
+      "id": "node-prepare-batches",
+      "name": "Prepare Matches for Batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3340, 420]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "node-split-batches",
+      "name": "Split in Batches (10)",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [3560, 420]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wcic:cache:match:{{ $json.external_id }}"
+      },
+      "id": "node-check-cache",
+      "name": "Check Match Cache",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3780, 420],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Node: Detect Changes\n// Compara dados atuais com cache para decidir se UPSERT é necessário\n// ============================================================\n\nconst match = $('Split in Batches (10)').item.json;\nconst cacheRaw = $input.item.json;\n\nlet cachedData = null;\nif (cacheRaw.value) {\n  try {\n    cachedData = JSON.parse(cacheRaw.value);\n  } catch(e) { /* cache corrompido */ }\n}\n\nconst currentHash = `${match.status}|${match.home_score}|${match.away_score}|${match.home_score_ht}|${match.away_score_ht}`;\nconst cachedHash = cachedData ? `${cachedData.status}|${cachedData.home_score}|${cachedData.away_score}|${cachedData.home_score_ht}|${cachedData.away_score_ht}` : null;\n\nconst hasChanged = !cachedData || currentHash !== cachedHash;\nconst prevStatus = cachedData?.status || null;\n\nreturn [{\n  json: {\n    ...match,\n    hasChanged,\n    prevStatus,\n    currentHash,\n  }\n}];\n"
+      },
+      "id": "node-detect-changes",
+      "name": "Detect Changes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4000, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-changed-check",
+              "leftValue": "={{ $json.hasChanged }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-has-changed",
+      "name": "Has Changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4220, 420]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.matches (\n  external_id, home_team_id, away_team_id, stage, scheduled_at,\n  status, home_score, away_score, home_score_ht, away_score_ht,\n  referee, source_api, last_sync_at, raw_payload\n) VALUES (\n  $1, $2::uuid, $3::uuid, $4::wcic.match_stage, $5::timestamptz,\n  $6::wcic.match_status, $7, $8, $9, $10,\n  $11, $12, NOW(), $13::jsonb\n)\nON CONFLICT (external_id) DO UPDATE SET\n  status         = EXCLUDED.status,\n  home_score     = EXCLUDED.home_score,\n  away_score     = EXCLUDED.away_score,\n  home_score_ht  = EXCLUDED.home_score_ht,\n  away_score_ht  = EXCLUDED.away_score_ht,\n  referee        = EXCLUDED.referee,\n  source_api     = EXCLUDED.source_api,\n  last_sync_at   = NOW(),\n  raw_payload    = EXCLUDED.raw_payload,\n  updated_at     = NOW()\nWHERE\n  wcic.matches.status         IS DISTINCT FROM EXCLUDED.status       OR\n  wcic.matches.home_score     IS DISTINCT FROM EXCLUDED.home_score   OR\n  wcic.matches.away_score     IS DISTINCT FROM EXCLUDED.away_score   OR\n  wcic.matches.home_score_ht  IS DISTINCT FROM EXCLUDED.home_score_ht OR\n  wcic.matches.away_score_ht  IS DISTINCT FROM EXCLUDED.away_score_ht\nRETURNING id::text, external_id, status, home_score, away_score;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.external_id,\n  $json.home_team_id,\n  $json.away_team_id,\n  $json.stage,\n  $json.scheduled_at,\n  $json.status,\n  $json.home_score,\n  $json.away_score,\n  $json.home_score_ht,\n  $json.away_score_ht,\n  $json.referee,\n  $json.source_api,\n  JSON.stringify($json.raw_payload)\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-upsert-match",
+      "name": "Upsert Match",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4440, 360],
+      "credentials": {
+        "postgres": {
+          "id": "cred-postgres",
+          "name": "WCIC PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=wcic:cache:match:{{ $('Detect Changes').item.json.external_id }}",
+        "value": "={{ JSON.stringify({ status: $('Detect Changes').item.json.status, home_score: $('Detect Changes').item.json.home_score, away_score: $('Detect Changes').item.json.away_score, home_score_ht: $('Detect Changes').item.json.home_score_ht, away_score_ht: $('Detect Changes').item.json.away_score_ht }) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 2100
+      },
+      "id": "node-update-cache",
+      "name": "Update Match Cache",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [4660, 360],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "live-check",
+              "leftValue": "={{ $('Detect Changes').item.json.status }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "halftime-check",
+              "leftValue": "={{ $('Detect Changes').item.json.status }}",
+              "rightValue": "halftime",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "node-is-live",
+      "name": "Is Live or Halftime?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4880, 300]
+    },
+    {
+      "parameters": {
+        "operation": "sadd",
+        "key": "=wcic:active_matches",
+        "value": "={{ $json.id }}"
+      },
+      "id": "node-sadd-active",
+      "name": "Add to Active Matches",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [5100, 200],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "finished-check",
+              "leftValue": "={{ $('Detect Changes').item.json.status }}",
+              "rightValue": "finished",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-is-finished",
+      "name": "Is Finished?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [5100, 420]
+    },
+    {
+      "parameters": {
+        "operation": "srem",
+        "key": "=wcic:active_matches",
+        "value": "={{ $('Upsert Match').item.json.id }}"
+      },
+      "id": "node-srem-active",
+      "name": "Remove from Active Matches",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [5320, 360],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "=wcic:pub:match.updated",
+        "value": "={{ JSON.stringify({ match_id: $('Upsert Match').item.json.id, external_id: $json.external_id, status: $('Upsert Match').item.json.status, home_score: $('Upsert Match').item.json.home_score, away_score: $('Upsert Match').item.json.away_score, correlation_id: $('Detect Changes').item.json.correlationId, ts: new Date().toISOString() }) }}"
+      },
+      "id": "node-publish-event",
+      "name": "Publish match.updated",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [5540, 420],
+      "credentials": {
+        "redis": {
+          "id": "cred-redis",
+          "name": "WCIC Redis"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (\n  execution_id, workflow_name, status, started_at,\n  finished_at, duration_ms, trigger_type, correlation_id,\n  items_processed, output_summary\n) VALUES (\n  $1, 'WF-01-match-collector', 'success', $2::timestamptz,\n  NOW(),\n  EXTRACT(EPOCH FROM (NOW() - $2::timestamptz)) * 1000,\n  'cron', $3::uuid,\n  $4,\n  $5::jsonb\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $('Init').first().json.executionId,\n  $('Init').first().json.startedAt,\n  $('Init').first().json.correlationId,\n  $('Prepare Matches for Batch').all().length,\n  JSON.stringify({ source_api: $('Normalize Payload').first().json.sourceApi, total_matches: $('Normalize Payload').first().json.totalMatches })\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-success",
+      "name": "Log Execution Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [5760, 420],
+      "credentials": {
+        "postgres": {
+          "id": "cred-postgres",
+          "name": "WCIC PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (\n  execution_id, workflow_name, status, started_at,\n  finished_at, duration_ms, trigger_type, correlation_id,\n  error_message\n) VALUES (\n  $1, 'WF-01-match-collector', 'error', $2::timestamptz,\n  NOW(),\n  EXTRACT(EPOCH FROM (NOW() - $2::timestamptz)) * 1000,\n  'cron', $3::uuid,\n  $4\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $('Init').first().json.executionId,\n  $('Init').first().json.startedAt,\n  $('Init').first().json.correlationId,\n  $execution.error?.message || 'Unknown error in WF-01'\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-error",
+      "name": "Log Execution Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2460, 480],
+      "credentials": {
+        "postgres": {
+          "id": "cred-postgres",
+          "name": "WCIC PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [[{ "node": "Init", "type": "main", "index": 0 }]]
+    },
+    "Init": {
+      "main": [[{ "node": "Log Start to Redis", "type": "main", "index": 0 }]]
+    },
+    "Log Start to Redis": {
+      "main": [[{ "node": "Check Circuit Breaker", "type": "main", "index": 0 }]]
+    },
+    "Check Circuit Breaker": {
+      "main": [[{ "node": "Circuit Open?", "type": "main", "index": 0 }]]
+    },
+    "Circuit Open?": {
+      "main": [
+        [{ "node": "Fetch RapidAPI (Fallback)", "type": "main", "index": 0 }],
+        [{ "node": "Fetch Football-Data API", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Football-Data API": {
+      "main": [
+        [{ "node": "Reset Error Counter", "type": "main", "index": 0 }],
+        [{ "node": "Handle Primary Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Handle Primary Error": {
+      "main": [[{ "node": "Increment Error Counter", "type": "main", "index": 0 }]]
+    },
+    "Increment Error Counter": {
+      "main": [[{ "node": "Set Error Counter TTL", "type": "main", "index": 0 }]]
+    },
+    "Set Error Counter TTL": {
+      "main": [[{ "node": "Error Threshold Reached?", "type": "main", "index": 0 }]]
+    },
+    "Error Threshold Reached?": {
+      "main": [
+        [{ "node": "Open Circuit Breaker", "type": "main", "index": 0 }],
+        [{ "node": "Fetch RapidAPI (Fallback)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Open Circuit Breaker": {
+      "main": [[{ "node": "Log Execution Error", "type": "main", "index": 0 }]]
+    },
+    "Reset Error Counter": {
+      "main": [[{ "node": "Normalize Payload", "type": "main", "index": 0 }]]
+    },
+    "Fetch RapidAPI (Fallback)": {
+      "main": [[{ "node": "Normalize Payload", "type": "main", "index": 0 }]]
+    },
+    "Normalize Payload": {
+      "main": [[{ "node": "Get Team ID Map from Cache", "type": "main", "index": 0 }]]
+    },
+    "Get Team ID Map from Cache": {
+      "main": [[{ "node": "Resolve Team IDs", "type": "main", "index": 0 }]]
+    },
+    "Resolve Team IDs": {
+      "main": [[{ "node": "Needs DB Fetch?", "type": "main", "index": 0 }]]
+    },
+    "Needs DB Fetch?": {
+      "main": [
+        [{ "node": "Fetch Team IDs from DB", "type": "main", "index": 0 }],
+        [{ "node": "Prepare Matches for Batch", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Team IDs from DB": {
+      "main": [[{ "node": "Build Team Map", "type": "main", "index": 0 }]]
+    },
+    "Build Team Map": {
+      "main": [[{ "node": "Cache Team Map (24h)", "type": "main", "index": 0 }]]
+    },
+    "Cache Team Map (24h)": {
+      "main": [[{ "node": "Prepare Matches for Batch", "type": "main", "index": 0 }]]
+    },
+    "Prepare Matches for Batch": {
+      "main": [[{ "node": "Split in Batches (10)", "type": "main", "index": 0 }]]
+    },
+    "Split in Batches (10)": {
+      "main": [[{ "node": "Check Match Cache", "type": "main", "index": 0 }]]
+    },
+    "Check Match Cache": {
+      "main": [[{ "node": "Detect Changes", "type": "main", "index": 0 }]]
+    },
+    "Detect Changes": {
+      "main": [[{ "node": "Has Changed?", "type": "main", "index": 0 }]]
+    },
+    "Has Changed?": {
+      "main": [
+        [{ "node": "Upsert Match", "type": "main", "index": 0 }],
+        [{ "node": "Split in Batches (10)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert Match": {
+      "main": [[{ "node": "Update Match Cache", "type": "main", "index": 0 }]]
+    },
+    "Update Match Cache": {
+      "main": [[{ "node": "Is Live or Halftime?", "type": "main", "index": 0 }]]
+    },
+    "Is Live or Halftime?": {
+      "main": [
+        [{ "node": "Add to Active Matches", "type": "main", "index": 0 }],
+        [{ "node": "Is Finished?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Finished?": {
+      "main": [
+        [{ "node": "Remove from Active Matches", "type": "main", "index": 0 }],
+        [{ "node": "Publish match.updated", "type": "main", "index": 0 }]
+      ]
+    },
+    "Remove from Active Matches": {
+      "main": [[{ "node": "Publish match.updated", "type": "main", "index": 0 }]]
+    },
+    "Add to Active Matches": {
+      "main": [[{ "node": "Publish match.updated", "type": "main", "index": 0 }]]
+    },
+    "Publish match.updated": {
+      "main": [[{ "node": "Log Execution Success", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [
+    { "createdAt": "2025-06-01T00:00:00.000Z", "updatedAt": "2025-06-01T00:00:00.000Z", "id": "tag-sprint2", "name": "sprint-2" },
+    { "createdAt": "2025-06-01T00:00:00.000Z", "updatedAt": "2025-06-01T00:00:00.000Z", "id": "tag-data-collection", "name": "data-collection" }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf01-v1-2-0"
+}
