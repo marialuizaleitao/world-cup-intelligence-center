@@ -1,0 +1,93 @@
+{
+  "name": "SWF - OpenAI News Analyst",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-swf-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Valida entrada e monta prompt para o News Analyst\n// Input esperado: { news_id, title, description, content, source, language, url }\n// ============================================================\nconst input = $input.first().json;\n\nif (!input.news_id) throw new Error('SWF-NewsAnalyst: news_id obrigatório');\nif (!input.title)   throw new Error('SWF-NewsAnalyst: title obrigatório');\n\nconst articleText = [\n  `TÍTULO: ${input.title}`,\n  input.description ? `RESUMO: ${input.description}` : null,\n  input.content     ? `CONTEÚDO:\\n${input.content.substring(0, 3000)}` : null,\n].filter(Boolean).join('\\n\\n');\n\nconst systemPrompt = `Você é um analista especializado em futebol da Copa do Mundo 2026.\nAnalise o artigo fornecido e retorne EXCLUSIVAMENTE um JSON válido conforme a estrutura abaixo.\nNão adicione texto antes ou depois do JSON. Não use markdown. Retorne apenas JSON puro.\n\n{\n  \"summary\": \"resumo objetivo em 2-3 frases em ${input.language === 'pt' ? 'português' : 'inglês'}\",\n  \"impact_score\": <número 0.0 a 1.0>,\n  \"impact_type\": \"<tactical|injury|form|controversy|lineup|suspension|weather|other>\",\n  \"sentiment\": \"<positive|negative|neutral|very_positive|very_negative>\",\n  \"key_insight\": \"o insight mais importante em uma frase\",\n  \"tags\": [\"array\", \"de\", \"palavras-chave\"],\n  \"topics\": [\"<injury|suspension|lineup|tactics|controversy|transfer|performance|weather|venue|historical>\"],\n  \"affected_teams\": [\"nomes dos times mencionados no artigo\"],\n  \"affected_players\": [\"nomes dos jogadores mencionados\"],\n  \"relevance_to_wc2026\": <número 0.0 a 1.0>\n}\n\nCritérios de impact_score:\n0.9-1.0: lesão de titular confirmada, expulsão, mudança de escalação oficial\n0.7-0.8: mudança tática significativa, controvérsia séria, suspensão\n0.5-0.6: declarações de treinador, análise tática, estatísticas relevantes\n0.3-0.4: cobertura geral, histórico, curiosidades\n0.0-0.2: conteúdo tangencialmente relacionado à Copa\n\nCritérios de relevance_to_wc2026: quão diretamente o artigo impacta a Copa 2026.`;\n\nconst startedAt = new Date().toISOString();\n\nreturn [{\n  json: {\n    news_id: input.news_id,\n    article_text: articleText,\n    system_prompt: systemPrompt,\n    language: input.language || 'en',\n    source: input.source,\n    started_at: startedAt,\n  }\n}];\n"
+      },
+      "id": "node-prepare-prompt",
+      "name": "Prepare Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ model: 'gpt-4o', messages: [ { role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.article_text } ], max_tokens: 800, temperature: 0.2, response_format: { type: 'json_object' } }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "node-call-openai",
+      "name": "Call OpenAI GPT-4o",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "cred-openai",
+          "name": "WCIC OpenAI"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse da resposta do GPT-4o\n// Valida schema e extrai métricas de uso\n// ============================================================\nconst prepData  = $('Prepare Prompt').first().json;\nconst apiResult = $input.first().json;\n\nconst finishedAt = new Date().toISOString();\nconst processingMs = new Date(finishedAt) - new Date(prepData.started_at);\n\n// Extrai conteúdo e métricas de tokens\nconst message = apiResult.choices?.[0]?.message?.content;\nconst tokensUsed = apiResult.usage?.total_tokens || 0;\n\nif (!message) {\n  throw new Error(`GPT retornou resposta vazia. Status: ${JSON.stringify(apiResult.error || apiResult)}`);\n}\n\nlet parsed;\ntry {\n  // Remove backticks de markdown caso o modelo os inclua mesmo com json_object mode\n  const clean = message.replace(/```json\\n?|```/g, '').trim();\n  parsed = JSON.parse(clean);\n} catch (e) {\n  throw new Error(`Falha ao parsear JSON do GPT: ${e.message}. Resposta: ${message.substring(0, 200)}`);\n}\n\n// Validação de campos obrigatórios\nconst required = ['summary', 'impact_score', 'impact_type', 'sentiment', 'key_insight'];\nfor (const field of required) {\n  if (parsed[field] === undefined || parsed[field] === null) {\n    throw new Error(`Campo obrigatório ausente na resposta GPT: ${field}`);\n  }\n}\n\n// Sanitização de valores\nconst impactScore = Math.min(1, Math.max(0, parseFloat(parsed.impact_score) || 0));\nconst relevance   = Math.min(1, Math.max(0, parseFloat(parsed.relevance_to_wc2026) || impactScore));\n\nconst VALID_IMPACT_TYPES = ['tactical','injury','form','controversy','lineup','suspension','weather','other'];\nconst VALID_SENTIMENTS   = ['positive','negative','neutral','very_positive','very_negative'];\nconst VALID_TOPICS       = ['injury','suspension','lineup','tactics','controversy','transfer','performance','weather','venue','historical'];\n\nconst impactType = VALID_IMPACT_TYPES.includes(parsed.impact_type) ? parsed.impact_type : 'other';\nconst sentiment  = VALID_SENTIMENTS.includes(parsed.sentiment) ? parsed.sentiment : 'neutral';\nconst topics     = (parsed.topics || []).filter(t => VALID_TOPICS.includes(t));\n\nreturn [{\n  json: {\n    news_id:             prepData.news_id,\n    summary:             parsed.summary || '',\n    impact_score:        impactScore,\n    impact_type:         impactType,\n    sentiment,\n    key_insight:         parsed.key_insight || null,\n    tags:                parsed.tags || [],\n    topics,\n    affected_teams:      parsed.affected_teams || [],\n    affected_players:    parsed.affected_players || [],\n    relevance_to_wc2026: relevance,\n    raw_gpt_response:    parsed,\n    // Auditoria\n    ai_model:            apiResult.model || 'gpt-4o',\n    prompt_version:      'v1.0',\n    tokens_used:         tokensUsed,\n    processing_ms:       processingMs,\n    finished_at:         finishedAt,\n  }\n}];\n"
+      },
+      "id": "node-parse-response",
+      "name": "Parse GPT Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Trata erro da chamada OpenAI\n// Retorna objeto de erro estruturado para o caller persistir\n// ============================================================\nconst prepData = $('Prepare Prompt').first().json;\nconst error = $input.first().json;\n\nconst errorMsg = error.error?.message || error.message || JSON.stringify(error);\n\nconsole.error(`[SWF-NewsAnalyst] GPT error for news_id=${prepData.news_id}: ${errorMsg}`);\n\nreturn [{\n  json: {\n    news_id: prepData.news_id,\n    gpt_error: true,\n    error_message: errorMsg,\n    processing_ms: new Date() - new Date(prepData.started_at),\n  }\n}];\n"
+      },
+      "id": "node-handle-gpt-error",
+      "name": "Handle GPT Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 480]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Prepare Prompt", "type": "main", "index": 0 }]]
+    },
+    "Prepare Prompt": {
+      "main": [[{ "node": "Call OpenAI GPT-4o", "type": "main", "index": 0 }]]
+    },
+    "Call OpenAI GPT-4o": {
+      "main": [
+        [{ "node": "Parse GPT Response", "type": "main", "index": 0 }],
+        [{ "node": "Handle GPT Error", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint4", "name": "sprint-4" }, { "id": "tag-ai", "name": "ai-agents" }],
+  "triggerCount": 0,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "swf-news-analyst-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/subworkflows/SWF-openai-news-analyst.json')); print(f'SWF News Analyst: {len(d[\"nodes\"])} nodes - JSON válido')"
