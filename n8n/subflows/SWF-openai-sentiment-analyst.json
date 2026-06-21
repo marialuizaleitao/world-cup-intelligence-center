@@ -1,0 +1,93 @@
+{
+  "name": "SWF - OpenAI Sentiment Analyst",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-swf-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Prepara prompt para o Sentiment Analyst\n// Input: { entity_type, entity_id, entity_name, posts[], source, language }\n// posts[]: [{ text, likes, shares, platform }]\n// ============================================================\nconst input = $input.first().json;\n\nif (!input.entity_type) throw new Error('SWF-SentimentAnalyst: entity_type obrigatório');\nif (!input.entity_id)   throw new Error('SWF-SentimentAnalyst: entity_id obrigatório');\nif (!input.posts || input.posts.length === 0) {\n  throw new Error('SWF-SentimentAnalyst: posts[] não pode ser vazio');\n}\n\n// Formata posts para o prompt (limitado a 50 posts, 200 chars cada)\nconst postsFormatted = input.posts\n  .slice(0, 50)\n  .map((p, i) => `[${i+1}] ${p.text.substring(0, 200)}${p.likes ? ` (👍${p.likes})` : ''}`)\n  .join('\\n');\n\nconst entityDesc = input.entity_name\n  ? `${input.entity_type} \"${input.entity_name}\"`\n  : `${input.entity_type} ID:${input.entity_id}`;\n\nconst langInstruction = input.language === 'pt'\n  ? 'Responda em português brasileiro.'\n  : 'Respond in English.';\n\nconst systemPrompt = `Você é um especialista em análise de sentimento de mídias sociais sobre futebol.\nAnalise os posts fornecidos sobre ${entityDesc} e retorne EXCLUSIVAMENTE um JSON válido.\nNão adicione texto antes ou depois do JSON. Retorne apenas JSON puro.\n${langInstruction}\n\n{\n  \"positive_ratio\": <0.0 a 1.0>,\n  \"negative_ratio\": <0.0 a 1.0>,\n  \"neutral_ratio\": <0.0 a 1.0>,\n  \"dominant_sentiment\": \"<very_positive|positive|neutral|negative|very_negative>\",\n  \"intensity\": \"<high|medium|low>\",\n  \"trending_topics\": [\"array dos 5 tópicos mais mencionados\"],\n  \"key_concerns\": [\"até 3 preocupações principais se sentimento negativo\"],\n  \"key_positives\": [\"até 3 pontos positivos se sentimento positivo\"],\n  \"ai_summary\": \"análise narrativa em 2-3 frases\",\n  \"unusual_signals\": \"qualquer padrão incomum detectado, ou null\",\n  \"confidence\": <0.0 a 1.0>\n}\n\nREGRAS:\n- positive_ratio + negative_ratio + neutral_ratio deve somar exatamente 1.0\n- intensity=high se a maioria dos posts tem engajamento elevado ou linguagem forte\n- Se volume de posts < 5, confidence deve ser < 0.5\n- unusual_signals: detectar bots, coordenação, mudança abrupta de tom`;\n\nreturn [{\n  json: {\n    entity_type:  input.entity_type,\n    entity_id:    input.entity_id,\n    entity_name:  input.entity_name || null,\n    source:       input.source || 'combined',\n    posts_count:  input.posts.length,\n    posts_text:   postsFormatted,\n    system_prompt: systemPrompt,\n    language:     input.language || 'en',\n    started_at:   new Date().toISOString(),\n  }\n}];\n"
+      },
+      "id": "node-prepare-prompt",
+      "name": "Prepare Sentiment Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ model: 'gpt-4o', messages: [ { role: 'system', content: $json.system_prompt }, { role: 'user', content: `Analise o sentimento dos seguintes ${$json.posts_count} posts sobre ${$json.entity_type}:\\n\\n${$json.posts_text}` } ], max_tokens: 600, temperature: 0.1, response_format: { type: 'json_object' } }) }}",
+        "options": { "timeout": 25000 }
+      },
+      "id": "node-call-openai",
+      "name": "Call OpenAI GPT-4o",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "cred-openai",
+          "name": "WCIC OpenAI"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse e validação da resposta do Sentiment Analyst\n// ============================================================\nconst prepData  = $('Prepare Sentiment Prompt').first().json;\nconst apiResult = $input.first().json;\n\nconst finishedAt   = new Date().toISOString();\nconst processingMs = new Date(finishedAt) - new Date(prepData.started_at);\nconst tokensUsed   = apiResult.usage?.total_tokens || 0;\n\nconst message = apiResult.choices?.[0]?.message?.content;\nif (!message) {\n  throw new Error(`GPT retornou resposta vazia: ${JSON.stringify(apiResult.error || {})}`);\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(message.replace(/```json\\n?|```/g, '').trim());\n} catch (e) {\n  throw new Error(`Falha ao parsear JSON do GPT Sentiment: ${e.message}`);\n}\n\n// Valida e normaliza ratios (devem somar 1.0)\nlet pos = Math.max(0, Math.min(1, parseFloat(parsed.positive_ratio) || 0));\nlet neg = Math.max(0, Math.min(1, parseFloat(parsed.negative_ratio) || 0));\nlet neu = Math.max(0, Math.min(1, parseFloat(parsed.neutral_ratio)  || 0));\n\nconst total = pos + neg + neu;\nif (total > 0 && Math.abs(total - 1.0) > 0.05) {\n  // Renormaliza se soma divergir mais de 5%\n  pos = pos / total;\n  neg = neg / total;\n  neu = neu / total;\n}\n\nconst VALID_DOM_SENT  = ['very_positive','positive','neutral','negative','very_negative'];\nconst VALID_INTENSITY = ['high','medium','low'];\n\nconst dominantSentiment = VALID_DOM_SENT.includes(parsed.dominant_sentiment)\n  ? parsed.dominant_sentiment : 'neutral';\nconst intensity = VALID_INTENSITY.includes(parsed.intensity) ? parsed.intensity : 'medium';\n\nreturn [{\n  json: {\n    entity_type:        prepData.entity_type,\n    entity_id:          prepData.entity_id,\n    entity_name:        prepData.entity_name,\n    source:             prepData.source,\n    positive_ratio:     parseFloat(pos.toFixed(3)),\n    negative_ratio:     parseFloat(neg.toFixed(3)),\n    neutral_ratio:      parseFloat(neu.toFixed(3)),\n    dominant_sentiment: dominantSentiment,\n    intensity,\n    volume:             prepData.posts_count,\n    trending_topics:    parsed.trending_topics || [],\n    key_concerns:       parsed.key_concerns || [],\n    key_positives:      parsed.key_positives || [],\n    ai_summary:         parsed.ai_summary || null,\n    unusual_signals:    parsed.unusual_signals || null,\n    confidence:         Math.min(1, Math.max(0, parseFloat(parsed.confidence) || 0.5)),\n    // Auditoria\n    ai_model:           apiResult.model || 'gpt-4o',\n    prompt_version:     'v1.0',\n    tokens_used:        tokensUsed,\n    processing_ms:      processingMs,\n  }\n}];\n"
+      },
+      "id": "node-parse-sentiment",
+      "name": "Parse Sentiment Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prepData = $('Prepare Sentiment Prompt').first().json;\nconst error = $input.first().json;\nconst errorMsg = error.error?.message || JSON.stringify(error);\nconsole.error(`[SWF-SentimentAnalyst] GPT error for entity=${prepData.entity_id}: ${errorMsg}`);\nreturn [{ json: { gpt_error: true, entity_id: prepData.entity_id, error_message: errorMsg } }];\n"
+      },
+      "id": "node-handle-error",
+      "name": "Handle GPT Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 480]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Prepare Sentiment Prompt", "type": "main", "index": 0 }]]
+    },
+    "Prepare Sentiment Prompt": {
+      "main": [[{ "node": "Call OpenAI GPT-4o", "type": "main", "index": 0 }]]
+    },
+    "Call OpenAI GPT-4o": {
+      "main": [
+        [{ "node": "Parse Sentiment Response", "type": "main", "index": 0 }],
+        [{ "node": "Handle GPT Error", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint4", "name": "sprint-4" }, { "id": "tag-ai", "name": "ai-agents" }],
+  "triggerCount": 0,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "swf-sentiment-analyst-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/subworkflows/SWF-openai-sentiment-analyst.json')); print(f'SWF Sentiment Analyst: {len(d[\"nodes\"])} nodes - JSON válido')"
