@@ -1,0 +1,451 @@
+{
+  "name": "WF-03 - News Intelligence",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "*/15 * * * *" }] }
+      },
+      "id": "node-schedule",
+      "name": "Schedule Trigger (15min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { v4: uuidv4 } = require('uuid');\nreturn [{\n  json: {\n    correlationId: uuidv4(),\n    startedAt: new Date().toISOString(),\n    executionId: $execution.id,\n    workflowName: 'WF-03-news-intelligence',\n    rateLimitKey: 'wcic:rl:wf03:openai',\n    deduplicationSetKey: 'wcic:dedup:news',\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id::text, name, source_type, url, language, query_template, requests_per_hour\nFROM wcic.news_sources\nWHERE is_active = true\nORDER BY priority DESC;",
+        "options": {}
+      },
+      "id": "node-load-sources",
+      "name": "Load Active Sources",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-split-sources",
+      "name": "Split by Source",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "is-newsapi", "leftValue": "={{ $json.source_type }}", "rightValue": "newsapi", "operator": { "type": "string", "operation": "equals" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-route-source",
+      "name": "Route by Source Type",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "q", "value": "={{ $json.query_template || 'FIFA World Cup 2026' }}" },
+            { "name": "language", "value": "={{ $json.language }}" },
+            { "name": "sortBy", "value": "publishedAt" },
+            { "name": "pageSize", "value": "20" },
+            { "name": "apiKey", "value": "={{ $credentials.newsApiKey || $env.NEWSAPI_KEY }}" }
+          ]
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "node-fetch-newsapi",
+      "name": "Fetch NewsAPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 260],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "node-fetch-rss",
+      "name": "Fetch RSS Feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 540],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Normaliza artigos do NewsAPI para schema interno\n// ============================================================\nconst source = $('Split by Source').item.json;\nconst apiResponse = $input.first().json;\n\nconst rawArticles = apiResponse.articles || [];\nconst normalized = [];\n\nfor (const a of rawArticles) {\n  if (!a.url || !a.title || a.title === '[Removed]') continue;\n\n  // Gera url_hash como SHA-256 hex da URL normalizada\n  // n8n não tem crypto nativo, usamos base64 como aproximação para dedup\n  // (hash real será calculado via execução SQL com md5 ou pelo índice UNIQUE)\n  const urlNormalized = a.url.toLowerCase().split('?')[0].replace(/\\/$/, '');\n  const urlHash = Buffer.from(urlNormalized).toString('hex').substring(0, 64).padEnd(64, '0');\n\n  normalized.push({\n    url:          a.url,\n    url_hash:     urlHash,\n    source:       source.name,\n    title:        a.title,\n    description:  a.description || null,\n    content:      a.content || null,\n    author:       a.author || null,\n    language:     source.language,\n    published_at: a.publishedAt || null,\n  });\n}\n\nreturn normalized.map(n => ({ json: n }));\n"
+      },
+      "id": "node-normalize-newsapi",
+      "name": "Normalize NewsAPI Articles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Normaliza feed RSS para schema interno\n// RSS retorna XML que o n8n converte automaticamente para JSON\n// ============================================================\nconst source = $('Split by Source').item.json;\nconst rssData = $input.first().json;\n\n// O n8n converte RSS/XML para JSON - estrutura varia por feed\nconst items = rssData.items || rssData.channel?.item || rssData.rss?.channel?.item || [];\nconst itemList = Array.isArray(items) ? items : [items];\n\nconst normalized = [];\n\nfor (const item of itemList) {\n  const url   = item.link || item.guid || null;\n  const title = item.title || null;\n  if (!url || !title) continue;\n\n  const urlNormalized = url.toLowerCase().split('?')[0].replace(/\\/$/, '');\n  const urlHash = Buffer.from(urlNormalized).toString('hex').substring(0, 64).padEnd(64, '0');\n\n  // Limpa tags HTML da descrição RSS\n  const rawDesc = item.description || item.summary || item['content:encoded'] || '';\n  const description = rawDesc.replace(/<[^>]*>/g, '').substring(0, 1000) || null;\n\n  normalized.push({\n    url,\n    url_hash:     urlHash,\n    source:       source.name,\n    title:        String(title).substring(0, 500),\n    description,\n    content:      null,\n    author:       item.author || item['dc:creator'] || null,\n    language:     source.language,\n    published_at: item.pubDate || item.published || item['dc:date'] || null,\n  });\n}\n\nreturn normalized.map(n => ({ json: n }));\n"
+      },
+      "id": "node-normalize-rss",
+      "name": "Normalize RSS Articles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 540]
+    },
+    {
+      "parameters": {
+        "operation": "smembers",
+        "key": "=wcic:dedup:news"
+      },
+      "id": "node-get-dedup-set",
+      "name": "Get Dedup Set",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1780, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Deduplicação: filtra artigos cujo url_hash já foi processado\n// Usa o SET Redis wcic:dedup:news como bloom filter eficiente\n// ============================================================\nconst dedupResult = $input.first().json;\nconst processedHashes = new Set(dedupResult.value || []);\n\n// Coleta artigos de ambas as fontes normalizadas\nlet allArticles = [];\ntry { allArticles = [...allArticles, ...$('Normalize NewsAPI Articles').all().map(i => i.json)]; } catch(e) {}\ntry { allArticles = [...allArticles, ...$('Normalize RSS Articles').all().map(i => i.json)]; } catch(e) {}\n\nconst newArticles = allArticles.filter(a => a.url_hash && !processedHashes.has(a.url_hash));\n\n// Remove duplicatas dentro do batch atual (mesmo url_hash)\nconst seen = new Set();\nconst dedupedBatch = newArticles.filter(a => {\n  if (seen.has(a.url_hash)) return false;\n  seen.add(a.url_hash);\n  return true;\n});\n\nconst initData = $('Init').first().json;\nconsole.log(`[WF-03] Total: ${allArticles.length}, Novos: ${dedupedBatch.length}`);\n\nreturn dedupedBatch.map(a => ({ json: { ...a, correlationId: initData.correlationId } }));\n"
+      },
+      "id": "node-dedup-filter",
+      "name": "Deduplicate Articles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.news (\n  url, url_hash, source, title, description, content,\n  author, language, published_at, processing_status\n) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, 'pending')\nON CONFLICT (url_hash) DO NOTHING\nRETURNING id::text, url_hash, title;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.url,\n  $json.url_hash,\n  $json.source,\n  $json.title,\n  $json.description || null,\n  $json.content || null,\n  $json.author || null,\n  $json.language || 'en',\n  $json.published_at || null\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-insert-news",
+      "name": "Insert News",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2220, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Marca url_hash no Redis e prepara item para análise IA\n// Só procede se o INSERT retornou uma linha (artigo era novo)\nconst insertResult = $input.first().json;\nconst article = $('Deduplicate Articles').item.json;\n\nconst wasInserted = insertResult?.id != null;\n\nif (!wasInserted) {\n  // Conflito: artigo já existia no banco mas não estava no Redis (inconsistência)\n  // Marca no Redis e para - não re-analisa\n  return [{ json: { skip: true, reason: 'already_in_db', url_hash: article.url_hash } }];\n}\n\nreturn [{\n  json: {\n    news_id:    insertResult.id,\n    url_hash:   article.url_hash,\n    title:      article.title,\n    description: article.description,\n    content:    article.content,\n    source:     article.source,\n    language:   article.language,\n    url:        article.url,\n    correlationId: article.correlationId,\n    should_analyze: true,\n  }\n}];\n"
+      },
+      "id": "node-post-insert",
+      "name": "Post Insert Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 400]
+    },
+    {
+      "parameters": {
+        "operation": "sadd",
+        "key": "=wcic:dedup:news",
+        "value": "={{ $json.url_hash }}"
+      },
+      "id": "node-mark-dedup",
+      "name": "Mark as Processed",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2660, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "=wcic:dedup:news",
+        "ttl": 604800
+      },
+      "id": "node-dedup-ttl",
+      "name": "Set Dedup TTL (7 days)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2880, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "should-analyze", "leftValue": "={{ $('Post Insert Check').item.json.should_analyze }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-should-analyze",
+      "name": "Should Analyze?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3100, 400]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wcic:rl:wf03:openai"
+      },
+      "id": "node-check-openai-rl",
+      "name": "Check OpenAI Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3320, 300],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rlResult = $input.first().json;\nconst current = parseInt(rlResult.value || '0');\nconst limit = 50; // max 50 análises por minuto\n\nif (current >= limit) {\n  return [{ json: { rate_limited: true, current, limit } }];\n}\nreturn [{ json: { rate_limited: false, current, limit } }];\n"
+      },
+      "id": "node-rl-decision",
+      "name": "Rate Limit Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3540, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "rl-check", "leftValue": "={{ $json.rate_limited }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-rl-gate",
+      "name": "Rate Limit Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3760, 300]
+    },
+    {
+      "parameters": {
+        "operation": "rpush",
+        "key": "=wcic:queue:news_analysis",
+        "value": "={{ JSON.stringify($('Post Insert Check').item.json) }}"
+      },
+      "id": "node-queue-analysis",
+      "name": "Queue for Later Analysis",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3980, 200],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "SWF - OpenAI News Analyst", "mode": "name" },
+        "options": { "waitForSubWorkflow": true }
+      },
+      "id": "node-call-news-analyst",
+      "name": "Call News Analyst",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [3980, 400]
+    },
+    {
+      "parameters": {
+        "operation": "incr",
+        "key": "=wcic:rl:wf03:openai"
+      },
+      "id": "node-incr-rl",
+      "name": "Increment Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [4200, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "=wcic:rl:wf03:openai",
+        "ttl": 60
+      },
+      "id": "node-rl-ttl",
+      "name": "Set RL TTL (60s)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [4420, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifica se o subworkflow retornou erro GPT\nconst swfResult = $input.first().json;\n\nif (swfResult.gpt_error) {\n  return [{ json: { persist: false, gpt_error: true, news_id: swfResult.news_id } }];\n}\n\n// Verifica campos obrigatórios mínimos\nif (!swfResult.summary || swfResult.impact_score === undefined) {\n  return [{ json: { persist: false, incomplete: true } }];\n}\n\nreturn [{ json: { persist: true, analysis: swfResult } }];\n"
+      },
+      "id": "node-check-analysis",
+      "name": "Check Analysis Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4640, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH team_ids AS (\n  SELECT id FROM wcic.teams\n  WHERE name = ANY($7::text[])\n)\nINSERT INTO wcic.news_analysis (\n  news_id, summary, impact_score, impact_type, sentiment,\n  key_insight, tags, topics, affected_team_ids, affected_player_ids,\n  raw_gpt_response, ai_model, prompt_version, tokens_used, processing_ms\n) VALUES (\n  $1::uuid, $2, $3::numeric, $4::wcic.impact_type, $5::wcic.sentiment_label,\n  $6, $8, $9,\n  ARRAY(SELECT id FROM team_ids)::uuid[],\n  '{}'::uuid[],\n  $10::jsonb, $11, $12, $13::integer, $14::integer\n)\nON CONFLICT (news_id) DO UPDATE SET\n  summary         = EXCLUDED.summary,\n  impact_score    = EXCLUDED.impact_score,\n  impact_type     = EXCLUDED.impact_type,\n  sentiment       = EXCLUDED.sentiment,\n  key_insight     = EXCLUDED.key_insight,\n  tags            = EXCLUDED.tags,\n  topics          = EXCLUDED.topics,\n  raw_gpt_response = EXCLUDED.raw_gpt_response,\n  tokens_used     = EXCLUDED.tokens_used,\n  processing_ms   = EXCLUDED.processing_ms\nRETURNING id::text, news_id::text, impact_score;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.analysis.news_id,\n  $json.analysis.summary,\n  $json.analysis.impact_score,\n  $json.analysis.impact_type || 'other',\n  $json.analysis.sentiment,\n  $json.analysis.key_insight || null,\n  $json.analysis.affected_teams || [],\n  $json.analysis.tags || [],\n  $json.analysis.topics || [],\n  JSON.stringify($json.analysis.raw_gpt_response || {}),\n  $json.analysis.ai_model || 'gpt-4o',\n  $json.analysis.prompt_version || 'v1.0',\n  $json.analysis.tokens_used || 0,\n  $json.analysis.processing_ms || 0\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-persist-analysis",
+      "name": "Persist Analysis",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4860, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wcic.news SET processing_status = $2::wcic.processing_status WHERE id = $1::uuid;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $('Check Analysis Result').item.json.analysis?.news_id || null,\n  $input.first().json.id ? 'processed' : 'failed'\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-update-news-status",
+      "name": "Update News Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [5080, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifica se artigo tem impacto alto para notificação via WF-07\nconst persistResult = $input.first().json;\nconst analysis = $('Check Analysis Result').item.json.analysis;\n\nif (!analysis || !persistResult.id) return [{ json: { notify: false } }];\n\nconst shouldNotify = analysis.impact_score >= 0.7;\nreturn [{ json: { notify: shouldNotify, analysis, notification_id: persistResult.id } }];\n"
+      },
+      "id": "node-check-notify",
+      "name": "High Impact?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [5300, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "notify-check", "leftValue": "={{ $json.notify }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-notify-if",
+      "name": "Should Notify?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [5520, 400]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "WF-07 - Notification Hub", "mode": "name" },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "node-call-wf07",
+      "name": "Call WF-07 (High Impact Alert)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [5740, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (\n  execution_id, workflow_name, status, started_at, finished_at,\n  duration_ms, trigger_type, correlation_id, items_processed, output_summary\n) VALUES (\n  $1, 'WF-03-news-intelligence', 'success', $2::timestamptz, NOW(),\n  EXTRACT(EPOCH FROM (NOW() - $2::timestamptz)) * 1000,\n  'cron', $3::uuid, $4, $5::jsonb\n);",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $('Init').first().json.executionId,\n  $('Init').first().json.startedAt,\n  $('Init').first().json.correlationId,\n  $('Deduplicate Articles').all().length,\n  JSON.stringify({ workflow: 'WF-03' })\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [5740, 500],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (15min)": { "main": [[{ "node": "Init", "type": "main", "index": 0 }]] },
+    "Init": { "main": [[{ "node": "Load Active Sources", "type": "main", "index": 0 }]] },
+    "Load Active Sources": { "main": [[{ "node": "Split by Source", "type": "main", "index": 0 }]] },
+    "Split by Source": { "main": [[{ "node": "Route by Source Type", "type": "main", "index": 0 }]] },
+    "Route by Source Type": {
+      "main": [
+        [{ "node": "Fetch RSS Feed", "type": "main", "index": 0 }],
+        [{ "node": "Fetch NewsAPI", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch NewsAPI": { "main": [[{ "node": "Normalize NewsAPI Articles", "type": "main", "index": 0 }], []] },
+    "Fetch RSS Feed": { "main": [[{ "node": "Normalize RSS Articles", "type": "main", "index": 0 }], []] },
+    "Normalize NewsAPI Articles": { "main": [[{ "node": "Get Dedup Set", "type": "main", "index": 0 }]] },
+    "Normalize RSS Articles": { "main": [[{ "node": "Get Dedup Set", "type": "main", "index": 0 }]] },
+    "Get Dedup Set": { "main": [[{ "node": "Deduplicate Articles", "type": "main", "index": 0 }]] },
+    "Deduplicate Articles": { "main": [[{ "node": "Insert News", "type": "main", "index": 0 }]] },
+    "Insert News": { "main": [[{ "node": "Post Insert Check", "type": "main", "index": 0 }]] },
+    "Post Insert Check": { "main": [[{ "node": "Mark as Processed", "type": "main", "index": 0 }]] },
+    "Mark as Processed": { "main": [[{ "node": "Set Dedup TTL (7 days)", "type": "main", "index": 0 }]] },
+    "Set Dedup TTL (7 days)": { "main": [[{ "node": "Should Analyze?", "type": "main", "index": 0 }]] },
+    "Should Analyze?": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Check OpenAI Rate Limit", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check OpenAI Rate Limit": { "main": [[{ "node": "Rate Limit Decision", "type": "main", "index": 0 }]] },
+    "Rate Limit Decision": { "main": [[{ "node": "Rate Limit Gate", "type": "main", "index": 0 }]] },
+    "Rate Limit Gate": {
+      "main": [
+        [{ "node": "Queue for Later Analysis", "type": "main", "index": 0 }],
+        [{ "node": "Call News Analyst", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call News Analyst": { "main": [[{ "node": "Increment Rate Limit", "type": "main", "index": 0 }]] },
+    "Increment Rate Limit": { "main": [[{ "node": "Set RL TTL (60s)", "type": "main", "index": 0 }]] },
+    "Set RL TTL (60s)": { "main": [[{ "node": "Check Analysis Result", "type": "main", "index": 0 }]] },
+    "Check Analysis Result": { "main": [[{ "node": "Persist Analysis", "type": "main", "index": 0 }]] },
+    "Persist Analysis": { "main": [[{ "node": "Update News Status", "type": "main", "index": 0 }]] },
+    "Update News Status": { "main": [[{ "node": "High Impact?", "type": "main", "index": 0 }]] },
+    "High Impact?": { "main": [[{ "node": "Should Notify?", "type": "main", "index": 0 }]] },
+    "Should Notify?": {
+      "main": [
+        [{ "node": "Call WF-07 (High Impact Alert)", "type": "main", "index": 0 }],
+        [{ "node": "Log Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call WF-07 (High Impact Alert)": { "main": [[{ "node": "Log Success", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint4", "name": "sprint-4" }, { "id": "tag-news", "name": "news-intelligence" }],
+  "triggerCount": 1,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf03-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/workflows/WF-03-news-intelligence.json')); print(f'WF-03: {len(d[\"nodes\"])} nodes, {len(d[\"connections\"])} connections - JSON válido')"
