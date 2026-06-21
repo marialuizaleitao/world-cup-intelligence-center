@@ -1,0 +1,334 @@
+{
+  "name": "WF-04 - Sentiment Analyzer",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "*/30 * * * *" }] }
+      },
+      "id": "node-schedule",
+      "name": "Schedule Trigger (30min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { v4: uuidv4 } = require('uuid');\nreturn [{\n  json: {\n    correlationId: uuidv4(),\n    startedAt: new Date().toISOString(),\n    executionId: $execution.id,\n    workflowName: 'WF-04-sentiment-analyzer',\n    // Fonte de dados para Sprint 4: notícias já analisadas pelo WF-03\n    // Sprint 5+: Twitter/Reddit via API\n    sourceType: 'newsapi',\n    lookbackHours: 6,\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  t.id::text AS entity_id,\n  t.name AS entity_name,\n  t.short_name AS entity_code,\n  'team' AS entity_type,\n  -- Agrega títulos + resumos de notícias recentes como proxy de sentimento\n  array_agg(\n    DISTINCT na.summary ORDER BY na.summary\n  ) FILTER (WHERE na.summary IS NOT NULL) AS news_summaries,\n  COUNT(n.id) AS news_count,\n  AVG(na.impact_score) AS avg_impact\nFROM wcic.teams t\nJOIN wcic.news_analysis na ON t.id = ANY(na.affected_team_ids)\nJOIN wcic.news n ON n.id = na.news_id\nWHERE n.created_at > NOW() - INTERVAL '6 hours'\n  AND na.impact_score >= 0.3\nGROUP BY t.id, t.name, t.short_name\nHAVING COUNT(n.id) >= 2\nORDER BY avg_impact DESC\nLIMIT 20;",
+        "options": {}
+      },
+      "id": "node-load-entities",
+      "name": "Load Teams with Recent News",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifica se há entidades para analisar\nconst entities = $input.all();\nif (entities.length === 0 || !entities[0].json.entity_id) {\n  console.log('[WF-04] Nenhuma entidade com notícias recentes para analisar');\n  return [{ json: { hasEntities: false } }];\n}\nreturn [{ json: { hasEntities: true, entityCount: entities.length } }];\n"
+      },
+      "id": "node-check-entities",
+      "name": "Has Entities?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "has-entities", "leftValue": "={{ $json.hasEntities }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-has-entities-if",
+      "name": "Has Entities?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (execution_id, workflow_name, status, started_at, finished_at, duration_ms, trigger_type, correlation_id, items_processed, output_summary) VALUES ($1, 'WF-04-sentiment-analyzer', 'success', $2::timestamptz, NOW(), EXTRACT(EPOCH FROM (NOW() - $2::timestamptz))*1000, 'cron', $3::uuid, 0, '{\"reason\":\"no_entities\"}'::jsonb);",
+        "additionalFields": { "queryParams": "={{ [$json.executionId || $('Init').first().json.executionId, $('Init').first().json.startedAt, $('Init').first().json.correlationId] }}" },
+        "options": {}
+      },
+      "id": "node-log-no-entities",
+      "name": "Log No Entities",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 260],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-split-entities",
+      "name": "Split by Entity",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1340, 540]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Converte summaries de notícias em 'posts' para o SWF Sentiment Analyst\nconst entity = $input.first().json;\nconst summaries = entity.news_summaries || [];\n\n// Trata como posts de análise de sentimento\nconst posts = summaries\n  .filter(s => s && s.length > 10)\n  .map(s => ({ text: s, likes: 0, shares: 0, platform: 'newsapi' }));\n\nif (posts.length === 0) {\n  return [{ json: { skip: true, reason: 'no_valid_summaries', entity_id: entity.entity_id } }];\n}\n\nreturn [{\n  json: {\n    entity_type:  entity.entity_type,\n    entity_id:    entity.entity_id,\n    entity_name:  entity.entity_name,\n    source:       'newsapi',\n    language:     'pt',\n    posts,\n    correlationId: $('Init').first().json.correlationId,\n  }\n}];\n"
+      },
+      "id": "node-prepare-sentiment-input",
+      "name": "Prepare Sentiment Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 540]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "skip-check", "leftValue": "={{ $json.skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-skip-if",
+      "name": "Skip?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1780, 540]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wcic:rl:wf04:openai"
+      },
+      "id": "node-check-rl",
+      "name": "Check OpenAI Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2000, 460],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rlResult = $input.first().json;\nconst current = parseInt(rlResult.value || '0');\nif (current >= 30) return [{ json: { rate_limited: true } }];\nreturn [{ json: { rate_limited: false } }];\n"
+      },
+      "id": "node-rl-decision",
+      "name": "Rate Limit Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 460]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "rl-check", "leftValue": "={{ $json.rate_limited }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-rl-gate",
+      "name": "Rate Limit Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2440, 460]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "SWF - OpenAI Sentiment Analyst", "mode": "name" },
+        "options": { "waitForSubWorkflow": true }
+      },
+      "id": "node-call-sentiment",
+      "name": "Call Sentiment Analyst",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [2660, 400]
+    },
+    {
+      "parameters": {
+        "operation": "incr",
+        "key": "=wcic:rl:wf04:openai"
+      },
+      "id": "node-incr-rl",
+      "name": "Increment Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2880, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "=wcic:rl:wf04:openai",
+        "ttl": 60
+      },
+      "id": "node-rl-ttl",
+      "name": "Set RL TTL",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3100, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const sentimentResult = $input.first().json;\nif (sentimentResult.gpt_error) {\n  return [{ json: { persist: false, gpt_error: true } }];\n}\nif (sentimentResult.positive_ratio === undefined) {\n  return [{ json: { persist: false, incomplete: true } }];\n}\nreturn [{ json: { persist: true, sentiment: sentimentResult } }];\n"
+      },
+      "id": "node-check-result",
+      "name": "Check Sentiment Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3320, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.sentiment_snapshots (\n  entity_type, entity_id, source, captured_at,\n  positive_ratio, negative_ratio, neutral_ratio,\n  dominant_sentiment, intensity, volume,\n  trending_topics, key_concerns, key_positives,\n  ai_summary, ai_model, tokens_used\n) VALUES (\n  $1, $2::uuid, $3, NOW(),\n  $4::numeric, $5::numeric, $6::numeric,\n  $7::wcic.sentiment_label, $8, $9::integer,\n  $10::text[], $11::text[], $12::text[],\n  $13, $14, $15::integer\n)\nRETURNING id::text, entity_id::text, dominant_sentiment, captured_at;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.sentiment.entity_type,\n  $json.sentiment.entity_id,\n  $json.sentiment.source || 'newsapi',\n  $json.sentiment.positive_ratio,\n  $json.sentiment.negative_ratio,\n  $json.sentiment.neutral_ratio,\n  $json.sentiment.dominant_sentiment,\n  $json.sentiment.intensity || 'medium',\n  $json.sentiment.volume || 0,\n  $json.sentiment.trending_topics || [],\n  $json.sentiment.key_concerns || [],\n  $json.sentiment.key_positives || [],\n  $json.sentiment.ai_summary || null,\n  $json.sentiment.ai_model || 'gpt-4o',\n  $json.sentiment.tokens_used || 0\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-persist-sentiment",
+      "name": "Persist Sentiment Snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3540, 360],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `wcic:cache:sentiment:${$('Check Sentiment Result').item.json.sentiment?.entity_type}:${$('Check Sentiment Result').item.json.sentiment?.entity_id}` }}",
+        "value": "={{ JSON.stringify({ positive_ratio: $json.positive_ratio, negative_ratio: $json.negative_ratio, neutral_ratio: $json.neutral_ratio, dominant_sentiment: $json.dominant_sentiment, intensity: $json.intensity, captured_at: $json.captured_at, }) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 1800
+      },
+      "id": "node-cache-sentiment",
+      "name": "Cache Sentiment (30min)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3760, 360],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Detecta mudança brusca de sentimento (delta > 20% em relação ao snapshot anterior)\n// Para Sprint 4: lógica simplificada - alerta se negativo > 60%\nconst sentimentResult = $('Check Sentiment Result').item.json.sentiment;\nif (!sentimentResult) return [{ json: { alert: false } }];\n\nconst shouldAlert = sentimentResult.negative_ratio > 0.6 || sentimentResult.unusual_signals;\nreturn [{ json: { alert: shouldAlert, sentiment: sentimentResult } }];\n"
+      },
+      "id": "node-detect-shift",
+      "name": "Detect Sentiment Shift",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3980, 360]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "alert-check", "leftValue": "={{ $json.alert }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-alert-if",
+      "name": "Alert Shift?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4200, 360]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "WF-07 - Notification Hub", "mode": "name" },
+        "options": { "waitForSubWorkflow": false }
+      },
+      "id": "node-call-wf07",
+      "name": "Alert via WF-07",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [4420, 280]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (execution_id, workflow_name, status, started_at, finished_at, duration_ms, trigger_type, correlation_id, items_processed, output_summary) VALUES ($1, 'WF-04-sentiment-analyzer', 'success', $2::timestamptz, NOW(), EXTRACT(EPOCH FROM (NOW() - $2::timestamptz))*1000, 'cron', $3::uuid, $4, '{}'::jsonb);",
+        "additionalFields": { "queryParams": "={{ [$('Init').first().json.executionId, $('Init').first().json.startedAt, $('Init').first().json.correlationId, 1] }}" },
+        "options": {}
+      },
+      "id": "node-log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4420, 440],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (30min)": { "main": [[{ "node": "Init", "type": "main", "index": 0 }]] },
+    "Init": { "main": [[{ "node": "Load Teams with Recent News", "type": "main", "index": 0 }]] },
+    "Load Teams with Recent News": { "main": [[{ "node": "Has Entities?", "type": "main", "index": 0 }]] },
+    "Has Entities?": { "main": [[{ "node": "Has Entities?", "type": "main", "index": 0 }]] },
+    "Has Entities?": {
+      "main": [
+        [{ "node": "Log No Entities", "type": "main", "index": 0 }],
+        [{ "node": "Split by Entity", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split by Entity": { "main": [[{ "node": "Prepare Sentiment Input", "type": "main", "index": 0 }]] },
+    "Prepare Sentiment Input": { "main": [[{ "node": "Skip?", "type": "main", "index": 0 }]] },
+    "Skip?": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Check OpenAI Rate Limit", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check OpenAI Rate Limit": { "main": [[{ "node": "Rate Limit Decision", "type": "main", "index": 0 }]] },
+    "Rate Limit Decision": { "main": [[{ "node": "Rate Limit Gate", "type": "main", "index": 0 }]] },
+    "Rate Limit Gate": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Call Sentiment Analyst", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call Sentiment Analyst": { "main": [[{ "node": "Increment Rate Limit", "type": "main", "index": 0 }]] },
+    "Increment Rate Limit": { "main": [[{ "node": "Set RL TTL", "type": "main", "index": 0 }]] },
+    "Set RL TTL": { "main": [[{ "node": "Check Sentiment Result", "type": "main", "index": 0 }]] },
+    "Check Sentiment Result": { "main": [[{ "node": "Persist Sentiment Snapshot", "type": "main", "index": 0 }]] },
+    "Persist Sentiment Snapshot": { "main": [[{ "node": "Cache Sentiment (30min)", "type": "main", "index": 0 }]] },
+    "Cache Sentiment (30min)": { "main": [[{ "node": "Detect Sentiment Shift", "type": "main", "index": 0 }]] },
+    "Detect Sentiment Shift": { "main": [[{ "node": "Alert Shift?", "type": "main", "index": 0 }]] },
+    "Alert Shift?": {
+      "main": [
+        [{ "node": "Alert via WF-07", "type": "main", "index": 0 }],
+        [{ "node": "Log Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Alert via WF-07": { "main": [[{ "node": "Log Success", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint4", "name": "sprint-4" }, { "id": "tag-sentiment", "name": "sentiment-analysis" }],
+  "triggerCount": 1,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf04-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/workflows/WF-04-sentiment-analyzer.json')); print(f'WF-04: {len(d[\"nodes\"])} nodes - JSON válido')"
