@@ -1,0 +1,260 @@
+# =============================================================================
+# WCIC - docker/prometheus/rules/news-intelligence.yml
+# Alerting rules para Sprint 4: News Intelligence + Sentiment Analysis
+# Carregado pelo Prometheus via prometheus.yml rule_files glob
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  # WF-03 - News Intelligence
+  # ===========================================================================
+  - name: wcic_wf03_news_intelligence
+    interval: 60s
+    rules:
+
+      # Workflow sem execuções nas últimas 20 minutos (deveria rodar a cada 15)
+      - alert: WF03NoRecentExecution
+        expr: |
+          (time() - max by(workflow_name) (
+            wcic_workflow_last_execution_timestamp{workflow_name="WF-03-news-intelligence"}
+          )) > 1200
+        for: 2m
+        labels:
+          severity: warning
+          workflow: wf03
+          sprint: "4"
+        annotations:
+          summary: "WF-03 News Intelligence sem execução recente"
+          description: >
+            WF-03 não executou nos últimos {{ $value | humanizeDuration }}.
+            Verificar se o workflow está ativo no n8n e se o cron está disparando.
+
+      # Taxa de erros do WF-03 acima de 20%
+      - alert: WF03HighErrorRate
+        expr: |
+          (
+            rate(wcic_workflow_executions_total{workflow_name="WF-03-news-intelligence", status="error"}[15m])
+            /
+            rate(wcic_workflow_executions_total{workflow_name="WF-03-news-intelligence"}[15m])
+          ) > 0.20
+        for: 5m
+        labels:
+          severity: critical
+          workflow: wf03
+          sprint: "4"
+        annotations:
+          summary: "WF-03 com taxa de erros alta ({{ $value | humanizePercentage }})"
+          description: >
+            Mais de 20% das execuções do WF-03 estão falhando nos últimos 15 minutos.
+            Verificar logs de erro no PostgreSQL: SELECT * FROM wcic.workflow_logs
+            WHERE workflow_name='WF-03-news-intelligence' AND status='error'
+            ORDER BY started_at DESC LIMIT 10;
+
+      # Fila de análise GPT crescendo (rate limit ou GPT fora)
+      - alert: WF03GPTQueueBacklog
+        expr: wcic_redis_list_length{key="wcic:queue:news_analysis"} > 50
+        for: 5m
+        labels:
+          severity: warning
+          workflow: wf03
+          sprint: "4"
+        annotations:
+          summary: "Fila de análise GPT acumulando ({{ $value }} itens)"
+          description: >
+            A fila wcic:queue:news_analysis tem {{ $value }} artigos aguardando análise.
+            Pode indicar rate limit da OpenAI atingido ou falha no SWF News Analyst.
+            Verificar: redis-cli LLEN wcic:queue:news_analysis
+
+      # Nenhum artigo coletado nas últimas 2 horas
+      - alert: WF03NoArticlesCollected
+        expr: |
+          increase(
+            wcic_news_articles_total[2h]
+          ) == 0
+        for: 10m
+        labels:
+          severity: warning
+          workflow: wf03
+          sprint: "4"
+        annotations:
+          summary: "WF-03 sem coleta de artigos nas últimas 2 horas"
+          description: >
+            Nenhum artigo novo inserido em wcic.news nas últimas 2 horas.
+            Verificar conectividade com NewsAPI e feeds RSS.
+            Possível causa: NEWSAPI_KEY inválida ou rate limit esgotado.
+
+      # Taxa de processamento GPT abaixo de 70%
+      - alert: WF03LowGPTProcessingRate
+        expr: |
+          (
+            wcic_news_articles_total{processing_status="processed"}
+            /
+            (wcic_news_articles_total{processing_status="processed"} + wcic_news_articles_total{processing_status="failed"})
+          ) < 0.70
+        for: 10m
+        labels:
+          severity: warning
+          workflow: wf03
+          sprint: "4"
+        annotations:
+          summary: "Taxa de processamento GPT abaixo de 70% ({{ $value | humanizePercentage }})"
+          description: >
+            Mais de 30% dos artigos estão com status='failed' no news_analysis.
+            Verificar saúde da OpenAI API e logs do SWF News Analyst.
+
+  # ===========================================================================
+  # WF-04 - Sentiment Analyzer
+  # ===========================================================================
+  - name: wcic_wf04_sentiment_analyzer
+    interval: 60s
+    rules:
+
+      # Workflow sem execuções nas últimas 40 minutos (deveria rodar a cada 30)
+      - alert: WF04NoRecentExecution
+        expr: |
+          (time() - max by(workflow_name) (
+            wcic_workflow_last_execution_timestamp{workflow_name="WF-04-sentiment-analyzer"}
+          )) > 2400
+        for: 5m
+        labels:
+          severity: warning
+          workflow: wf04
+          sprint: "4"
+        annotations:
+          summary: "WF-04 Sentiment Analyzer sem execução recente"
+          description: >
+            WF-04 não executou nos últimos {{ $value | humanizeDuration }}.
+            Verificar se o WF-03 está populando news_analysis com affected_team_ids.
+
+      # Nenhum snapshot de sentimento nas últimas 2 horas
+      - alert: WF04NoSentimentSnapshots
+        expr: |
+          increase(wcic_sentiment_snapshots_total[2h]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          workflow: wf04
+          sprint: "4"
+        annotations:
+          summary: "WF-04 sem snapshots de sentimento nas últimas 2 horas"
+          description: >
+            Nenhum registro inserido em wcic.sentiment_snapshots nas últimas 2 horas.
+            Verificar se o WF-03 está gerando análises com affected_team_ids preenchidos.
+
+      # Sentimento muito negativo persistente de uma seleção
+      - alert: WF04PersistentNegativeSentiment
+        expr: |
+          max by(entity_id) (
+            wcic_sentiment_negative_ratio{entity_type="team"}
+          ) > 0.75
+        for: 30m
+        labels:
+          severity: info
+          workflow: wf04
+          sprint: "4"
+        annotations:
+          summary: "Seleção com sentimento muito negativo persistente ({{ $value | humanizePercentage }})"
+          description: >
+            Uma ou mais seleções estão com negative_ratio acima de 75% por mais de 30 minutos.
+            Verificar se há eventos relevantes (lesão, controvérsia, resultado ruim).
+
+  # ===========================================================================
+  # OpenAI - GPT-4o (Sprint 4)
+  # ===========================================================================
+  - name: wcic_openai_sprint4
+    interval: 30s
+    rules:
+
+      # Tokens OpenAI acima de 80% do budget diário
+      - alert: OpenAIBudgetAlert
+        expr: |
+          wcic_openai_tokens_used_today_total
+          / on() group_left()
+          wcic_openai_daily_budget_tokens
+          > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          component: openai
+          sprint: "4"
+        annotations:
+          summary: "OpenAI consumiu {{ $value | humanizePercentage }} do budget diário"
+          description: >
+            O consumo de tokens OpenAI está acima de 80% do budget configurado.
+            Considerar reduzir frequência dos WF-03 e WF-04 ou aumentar o budget.
+
+      # Taxa de erros GPT acima de 10%
+      - alert: OpenAIHighErrorRate
+        expr: |
+          (
+            rate(wcic_openai_errors_total[10m])
+            /
+            rate(wcic_openai_requests_total[10m])
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: critical
+          component: openai
+          sprint: "4"
+        annotations:
+          summary: "Taxa de erros OpenAI acima de 10% ({{ $value | humanizePercentage }})"
+          description: >
+            Mais de 10% das chamadas à OpenAI API estão falhando.
+            Verificar status em https://status.openai.com
+            Os artigos afetados são enfileirados em wcic:queue:news_analysis.
+
+      # Latência GPT p95 acima de 15 segundos
+      - alert: OpenAIHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(wcic_openai_latency_ms_bucket[10m])
+          ) > 15000
+        for: 5m
+        labels:
+          severity: warning
+          component: openai
+          sprint: "4"
+        annotations:
+          summary: "Latência OpenAI p95 acima de 15s ({{ $value }}ms)"
+          description: >
+            95% das chamadas à OpenAI levam mais de 15 segundos para responder.
+            Pode indicar sobrecarga nos servidores da OpenAI.
+
+  # ===========================================================================
+  # Deduplicação de Notícias
+  # ===========================================================================
+  - name: wcic_news_deduplication
+    interval: 120s
+    rules:
+
+      # Set Redis de deduplicação muito grande (risco de OOM)
+      - alert: NewsDedupSetTooLarge
+        expr: wcic_redis_set_cardinality{key="wcic:dedup:news"} > 50000
+        for: 10m
+        labels:
+          severity: warning
+          component: redis
+          sprint: "4"
+        annotations:
+          summary: "Set de deduplicação de notícias muito grande ({{ $value }} URLs)"
+          description: >
+            O set wcic:dedup:news tem mais de 50.000 entradas.
+            Com TTL de 7 dias e ~200 artigos/dia isso é normal após 250 dias.
+            Se Redis tiver memória limitada, considerar reduzir TTL.
+            Verificar: redis-cli SCARD wcic:dedup:news
+
+      # Artigos duplicados detectados no banco
+      - alert: NewsDuplicatesInDB
+        expr: wcic_news_duplicate_count > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: database
+          sprint: "4"
+        annotations:
+          summary: "Artigos duplicados detectados em wcic.news ({{ $value }})"
+          description: >
+            SELECT url_hash, COUNT(*) FROM wcic.news
+            GROUP BY url_hash HAVING COUNT(*) > 1;
+            Duplicatas indicam falha no índice UNIQUE ou race condition no WF-03.
