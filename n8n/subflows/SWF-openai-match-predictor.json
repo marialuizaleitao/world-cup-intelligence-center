@@ -1,0 +1,90 @@
+{
+  "name": "SWF - OpenAI Match Predictor",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-swf-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Valida entrada e constrói prompt estruturado para o Match Predictor\n// Input: { match_id, home_team, away_team, stage, stats (match_stats row),\n//          news_context[], sentiment_context{} }\n// ============================================================\nconst input = $input.first().json;\n\nif (!input.match_id)  throw new Error('SWF-MatchPredictor: match_id obrigatório');\nif (!input.home_team) throw new Error('SWF-MatchPredictor: home_team obrigatório');\nif (!input.away_team) throw new Error('SWF-MatchPredictor: away_team obrigatório');\n\nconst s = input.stats || {};\n\n// Formata forma recente como string legível\nconst formatForm = (arr) => Array.isArray(arr) && arr.length > 0 ? arr.join('') : 'N/A';\n\n// Formata notícias de impacto\nconst newsLines = (input.news_context || []).slice(0, 5).map((n, i) =>\n  `  [${i+1}] ${n.source} - Impact: ${n.impact_score?.toFixed(2)} - ${n.key_insight || n.title}`\n).join('\\n') || '  Sem notícias relevantes nas últimas 24h';\n\n// Monta seção de sentimento\nconst sentHome = input.sentiment_context?.home || {};\nconst sentAway = input.sentiment_context?.away || {};\nconst sentLines = [\n  `  ${input.home_team}: positivo=${(sentHome.positive_ratio||0).toFixed(2)}, negativo=${(sentHome.negative_ratio||0).toFixed(2)} (${sentHome.dominant_sentiment||'N/A'})`,\n  `  ${input.away_team}: positivo=${(sentAway.positive_ratio||0).toFixed(2)}, negativo=${(sentAway.negative_ratio||0).toFixed(2)} (${sentAway.dominant_sentiment||'N/A'})`,\n].join('\\n');\n\nconst systemPrompt = `Você é um estatístico esportivo especializado em previsão de resultados de Copa do Mundo.\nAnalise os dados fornecidos e gere uma previsão probabilística fundamentada.\nRetorne EXCLUSIVAMENTE um JSON válido. Não adicione texto, não use markdown.\n\n{\n  \"home_win_prob\": <0.000 a 1.000>,\n  \"draw_prob\": <0.000 a 1.000>,\n  \"away_win_prob\": <0.000 a 1.000>,\n  \"predicted_home_score\": <integer 0-9>,\n  \"predicted_away_score\": <integer 0-9>,\n  \"confidence\": <0.00 a 1.00>,\n  \"key_factors\": [\"fator 1\", \"fator 2\", \"fator 3\"],\n  \"risk_factors\": [\"risco 1\", \"risco 2\"],\n  \"justification\": \"análise narrativa em 3-5 frases\",\n  \"over_under_2_5\": \"over\" ou \"under\",\n  \"both_teams_score\": true ou false\n}\n\nREGRAS OBRIGATÓRIAS:\n- home_win_prob + draw_prob + away_win_prob = 1.000 (exatamente)\n- confidence < 0.40 se dados históricos insuficientes (< 3 jogos)\n- confidence < 0.50 se lesões/suspensões críticas de titulares\n- Justificativa deve citar ao menos 2 fatores quantitativos dos dados fornecidos\n- NÃO fabricar estatísticas não presentes nos dados`;\n\nconst userContent = `PARTIDA: ${input.home_team} vs ${input.away_team}\nFASE: ${input.stage || 'Copa do Mundo 2026'}\nDATA: ${input.scheduled_at || 'N/A'}\n\nFORMA RECENTE (últimos 5 jogos):\n  ${input.home_team}: ${formatForm(s.home_form)} - ${s.home_form_pts || 0} pontos\n  ${input.away_team}: ${formatForm(s.away_form)} - ${s.away_form_pts || 0} pontos\n\nMÉDIAS DE GOLS:\n  ${input.home_team}: ${s.home_goals_scored_avg?.toFixed(2) || 'N/A'} marcados / ${s.home_goals_conceded_avg?.toFixed(2) || 'N/A'} sofridos por jogo\n  ${input.away_team}: ${s.away_goals_scored_avg?.toFixed(2) || 'N/A'} marcados / ${s.away_goals_conceded_avg?.toFixed(2) || 'N/A'} sofridos por jogo\n\nHISTÓRICO HEAD-TO-HEAD (últimos 10 jogos):\n  ${input.home_team} venceu: ${s.h2h_home_wins || 0} | Empates: ${s.h2h_draws || 0} | ${input.away_team} venceu: ${s.h2h_away_wins || 0}\n  Média de gols: ${input.home_team} ${s.h2h_home_goals_avg?.toFixed(2) || 'N/A'} x ${s.h2h_away_goals_avg?.toFixed(2) || 'N/A'} ${input.away_team}\n\nDESEMPENHO NA COPA 2026:\n  ${input.home_team}: ${s.home_goals_in_tournament || 0} gols em ${s.home_matches_in_tournament || 0} jogos\n  ${input.away_team}: ${s.away_goals_in_tournament || 0} gols em ${s.away_matches_in_tournament || 0} jogos\n\nCONTEXTO DE LESÕES/SUSPENSÕES:\n  ${input.home_team}: ${s.home_suspended_count || 0} suspensões, notícias de lesão: ${s.home_has_injury_news ? 'SIM' : 'NÃO'}\n  ${input.away_team}: ${s.away_suspended_count || 0} suspensões, notícias de lesão: ${s.away_has_injury_news ? 'SIM' : 'NÃO'}\n\nNOTÍCIAS RECENTES (últimas 24h, por impacto):\n${newsLines}\n\nSENTIMENTO PÚBLICO:\n${sentLines}\n\nGere a previsão baseando-se nos dados acima.`;\n\nreturn [{\n  json: {\n    match_id:    input.match_id,\n    home_team:   input.home_team,\n    away_team:   input.away_team,\n    system_prompt: systemPrompt,\n    user_content:  userContent,\n    started_at:    new Date().toISOString(),\n  }\n}];\n"
+      },
+      "id": "node-prepare-prompt",
+      "name": "Prepare Predictor Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ model: 'gpt-4o', messages: [ { role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_content } ], max_tokens: 1000, temperature: 0.15, response_format: { type: 'json_object' } }) }}",
+        "options": { "timeout": 35000 }
+      },
+      "id": "node-call-openai",
+      "name": "Call OpenAI GPT-4o",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "credentials": {
+        "openAiApi": { "id": "cred-openai", "name": "WCIC OpenAI" }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Parse e validação rigorosa da previsão do GPT\n// ============================================================\nconst prepData  = $('Prepare Predictor Prompt').first().json;\nconst apiResult = $input.first().json;\n\nconst finishedAt   = new Date().toISOString();\nconst processingMs = new Date(finishedAt) - new Date(prepData.started_at);\nconst tokensUsed   = apiResult.usage?.total_tokens || 0;\n\nconst message = apiResult.choices?.[0]?.message?.content;\nif (!message) {\n  throw new Error(`GPT retornou vazio: ${JSON.stringify(apiResult.error || {})}`);\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(message.replace(/```json\\n?|```/g, '').trim());\n} catch (e) {\n  throw new Error(`Falha ao parsear JSON do Predictor: ${e.message}. Resposta: ${message.substring(0, 300)}`);\n}\n\n// Extrai e valida probabilidades\nlet homeP = parseFloat(parsed.home_win_prob);\nlet drawP = parseFloat(parsed.draw_prob);\nlet awayP = parseFloat(parsed.away_win_prob);\n\n// Valida range individual\nif (isNaN(homeP) || isNaN(drawP) || isNaN(awayP)) {\n  throw new Error('Probabilidades inválidas (NaN) na resposta do GPT');\n}\nhomeP = Math.max(0.001, Math.min(0.998, homeP));\ndrawP = Math.max(0.001, Math.min(0.998, drawP));\nawayP = Math.max(0.001, Math.min(0.998, awayP));\n\n// Renormaliza para somar exatamente 1.000\nconst total = homeP + drawP + awayP;\nhomeP = parseFloat((homeP / total).toFixed(3));\ndrawP = parseFloat((drawP / total).toFixed(3));\nawayP = parseFloat((1.0 - homeP - drawP).toFixed(3)); // garante soma exata\n\n// Ajuste final: evita floating point que cause violação da constraint\nconst checkSum = homeP + drawP + awayP;\nif (Math.abs(checkSum - 1.0) > 0.004) {\n  awayP = parseFloat((awayP + (1.0 - checkSum)).toFixed(3));\n}\n\nconst confidence = Math.min(1, Math.max(0, parseFloat(parsed.confidence) || 0.5));\nconst predHome = Math.max(0, Math.min(9, parseInt(parsed.predicted_home_score) || 0));\nconst predAway = Math.max(0, Math.min(9, parseInt(parsed.predicted_away_score) || 0));\n\nconst validOU = ['over', 'under'];\nconst overUnder = validOU.includes(parsed.over_under_2_5) ? parsed.over_under_2_5 : null;\n\nconst justification = parsed.justification || '';\nif (justification.length < 20) {\n  throw new Error(`Justificativa insuficiente (${justification.length} chars)`);\n}\n\nreturn [{\n  json: {\n    match_id:              prepData.match_id,\n    home_win_prob:         homeP,\n    draw_prob:             drawP,\n    away_win_prob:         awayP,\n    predicted_home_score:  predHome,\n    predicted_away_score:  predAway,\n    confidence,\n    key_factors:           parsed.key_factors || [],\n    risk_factors:          parsed.risk_factors || [],\n    justification,\n    over_under_2_5:        overUnder,\n    both_teams_score:      typeof parsed.both_teams_score === 'boolean' ? parsed.both_teams_score : null,\n    raw_gpt_response:      parsed,\n    // Auditoria\n    ai_model:              apiResult.model || 'gpt-4o',\n    prompt_version:        'v1.0',\n    tokens_used:           tokensUsed,\n    processing_ms:         processingMs,\n    finished_at:           finishedAt,\n  }\n}];\n"
+      },
+      "id": "node-parse-prediction",
+      "name": "Parse Prediction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prepData = $('Prepare Predictor Prompt').first().json;\nconst error = $input.first().json;\nconst errorMsg = error.error?.message || JSON.stringify(error);\nconsole.error(`[SWF-MatchPredictor] GPT error for match=${prepData.match_id}: ${errorMsg}`);\nreturn [{ json: { gpt_error: true, match_id: prepData.match_id, error_message: errorMsg, processing_ms: new Date() - new Date(prepData.started_at) } }];\n"
+      },
+      "id": "node-handle-error",
+      "name": "Handle GPT Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 480]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Prepare Predictor Prompt", "type": "main", "index": 0 }]]
+    },
+    "Prepare Predictor Prompt": {
+      "main": [[{ "node": "Call OpenAI GPT-4o", "type": "main", "index": 0 }]]
+    },
+    "Call OpenAI GPT-4o": {
+      "main": [
+        [{ "node": "Parse Prediction", "type": "main", "index": 0 }],
+        [{ "node": "Handle GPT Error", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint5", "name": "sprint-5" }, { "id": "tag-ai", "name": "ai-agents" }],
+  "triggerCount": 0,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "swf-match-predictor-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/subworkflows/SWF-openai-match-predictor.json')); print(f'SWF Match Predictor: {len(d[\"nodes\"])} nodes - JSON válido')"
