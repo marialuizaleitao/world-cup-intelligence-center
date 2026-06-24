@@ -1,0 +1,353 @@
+{
+  "name": "WF-05 - AI Prediction Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "*/30 * * * *" }] }
+      },
+      "id": "node-schedule",
+      "name": "Schedule Trigger (30min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { v4: uuidv4 } = require('uuid');\nreturn [{\n  json: {\n    correlationId:    uuidv4(),\n    startedAt:        new Date().toISOString(),\n    executionId:      $execution.id,\n    workflowName:     'WF-05-ai-prediction-engine',\n    predictionWindow: 120,  // gera previsões para jogos nas próximas 2h\n    rateLimitKey:     'wcic:rl:wf05:openai',\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  m.id::text AS match_id,\n  m.scheduled_at,\n  m.stage::text,\n  ht.id::text AS home_team_id,\n  ht.name AS home_team,\n  ht.short_name AS home_code,\n  ht.country_code AS home_country,\n  ht.fifa_ranking AS home_ranking,\n  at.id::text AS away_team_id,\n  at.name AS away_team,\n  at.short_name AS away_code,\n  at.country_code AS away_country,\n  at.fifa_ranking AS away_ranking,\n  v.name AS venue_name,\n  v.city AS venue_city,\n  v.timezone AS venue_timezone\nFROM wcic.matches m\nJOIN wcic.teams ht ON ht.id = m.home_team_id\nJOIN wcic.teams at ON at.id = m.away_team_id\nLEFT JOIN wcic.venues v ON v.id = m.venue_id\nWHERE m.status = 'scheduled'\n  AND m.scheduled_at BETWEEN NOW() AND NOW() + INTERVAL '2 hours'\n  AND NOT EXISTS (\n    SELECT 1 FROM wcic.predictions p\n    WHERE p.match_id = m.id\n      AND p.prediction_type = 'pre_match'\n      AND p.created_at > NOW() - INTERVAL '6 hours'\n  )\nORDER BY m.scheduled_at ASC\nLIMIT 10;",
+        "options": {}
+      },
+      "id": "node-load-upcoming",
+      "name": "Load Upcoming Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const matches = $input.all();\nconst initData = $('Init').first().json;\n\nif (matches.length === 0 || !matches[0].json.match_id) {\n  console.log('[WF-05] Nenhuma partida elegível para previsão');\n  return [{ json: { hasMatches: false, ...initData } }];\n}\nreturn [{ json: { hasMatches: true, matchCount: matches.length, ...initData } }];\n"
+      },
+      "id": "node-check-matches",
+      "name": "Check Upcoming Matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "has-matches", "leftValue": "={{ $json.hasMatches }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-has-matches-if",
+      "name": "Has Matches?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (execution_id, workflow_name, status, started_at, finished_at, duration_ms, trigger_type, correlation_id, items_processed, output_summary) VALUES ($1, 'WF-05-ai-prediction-engine', 'success', $2::timestamptz, NOW(), EXTRACT(EPOCH FROM (NOW()-$2::timestamptz))*1000, 'cron', $3::uuid, 0, '{\"reason\":\"no_upcoming_matches\"}'::jsonb);",
+        "additionalFields": { "queryParams": "={{ [$('Init').first().json.executionId, $('Init').first().json.startedAt, $('Init').first().json.correlationId] }}" },
+        "options": {}
+      },
+      "id": "node-log-no-matches",
+      "name": "Log No Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 260],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-split-matches",
+      "name": "Split by Match",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1340, 540]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH home_matches AS (\n  SELECT home_score AS goals_scored, away_score AS goals_conceded,\n         CASE WHEN winner_team_id = $1::uuid THEN 'W' WHEN winner_team_id IS NULL AND status='finished' THEN 'D' WHEN status='finished' THEN 'L' END AS result\n  FROM wcic.matches WHERE (home_team_id = $1::uuid OR away_team_id = $1::uuid)\n    AND status = 'finished' ORDER BY finished_at DESC NULLS LAST LIMIT 5\n),\naway_matches AS (\n  SELECT home_score AS goals_scored, away_score AS goals_conceded,\n         CASE WHEN winner_team_id = $2::uuid THEN 'W' WHEN winner_team_id IS NULL AND status='finished' THEN 'D' WHEN status='finished' THEN 'L' END AS result\n  FROM wcic.matches WHERE (home_team_id = $2::uuid OR away_team_id = $2::uuid)\n    AND status = 'finished' ORDER BY finished_at DESC NULLS LAST LIMIT 5\n),\nh2h AS (\n  SELECT\n    COUNT(CASE WHEN winner_team_id = $1::uuid THEN 1 END) AS home_wins,\n    COUNT(CASE WHEN winner_team_id IS NULL AND status='finished' THEN 1 END) AS draws,\n    COUNT(CASE WHEN winner_team_id = $2::uuid THEN 1 END) AS away_wins,\n    AVG(CASE WHEN home_team_id = $1::uuid THEN home_score ELSE away_score END) AS home_goals_avg,\n    AVG(CASE WHEN home_team_id = $2::uuid THEN home_score ELSE away_score END) AS away_goals_avg\n  FROM wcic.matches\n  WHERE ((home_team_id = $1::uuid AND away_team_id = $2::uuid) OR (home_team_id = $2::uuid AND away_team_id = $1::uuid))\n    AND status = 'finished'\n  LIMIT 10\n),\ntournament_home AS (\n  SELECT COALESCE(SUM(CASE WHEN home_team_id=$1::uuid THEN home_score ELSE away_score END),0) AS goals,\n         COUNT(*) FILTER (WHERE status='finished') AS matches\n  FROM wcic.matches WHERE (home_team_id=$1::uuid OR away_team_id=$1::uuid) AND status='finished'\n),\ntournament_away AS (\n  SELECT COALESCE(SUM(CASE WHEN home_team_id=$2::uuid THEN home_score ELSE away_score END),0) AS goals,\n         COUNT(*) FILTER (WHERE status='finished') AS matches\n  FROM wcic.matches WHERE (home_team_id=$2::uuid OR away_team_id=$2::uuid) AND status='finished'\n)\nSELECT\n  ARRAY(SELECT result FROM home_matches WHERE result IS NOT NULL) AS home_form,\n  ROUND(AVG(hm.goals_scored)::numeric,2) AS home_goals_scored_avg,\n  ROUND(AVG(hm.goals_conceded)::numeric,2) AS home_goals_conceded_avg,\n  ARRAY(SELECT result FROM away_matches WHERE result IS NOT NULL) AS away_form,\n  ROUND(AVG(am.goals_scored)::numeric,2) AS away_goals_scored_avg,\n  ROUND(AVG(am.goals_conceded)::numeric,2) AS away_goals_conceded_avg,\n  (SELECT home_wins FROM h2h) AS h2h_home_wins,\n  (SELECT draws FROM h2h) AS h2h_draws,\n  (SELECT away_wins FROM h2h) AS h2h_away_wins,\n  ROUND((SELECT home_goals_avg FROM h2h)::numeric,2) AS h2h_home_goals_avg,\n  ROUND((SELECT away_goals_avg FROM h2h)::numeric,2) AS h2h_away_goals_avg,\n  (SELECT goals FROM tournament_home) AS home_goals_in_tournament,\n  (SELECT matches FROM tournament_home) AS home_matches_in_tournament,\n  (SELECT goals FROM tournament_away) AS away_goals_in_tournament,\n  (SELECT matches FROM tournament_away) AS away_matches_in_tournament\nFROM home_matches hm, away_matches am;",
+        "additionalFields": {
+          "queryParams": "={{ [$('Split by Match').item.json.home_team_id, $('Split by Match').item.json.away_team_id] }}"
+        },
+        "options": {}
+      },
+      "id": "node-fetch-stats",
+      "name": "Fetch Match Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 540],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  na.key_insight, na.impact_score, na.impact_type, na.sentiment,\n  n.title, n.source,\n  na.affected_team_ids,\n  (na.impact_type = 'injury' OR na.impact_type = 'suspension') AS is_alert\nFROM wcic.news_analysis na\nJOIN wcic.news n ON n.id = na.news_id\nWHERE (\n    $1::uuid = ANY(na.affected_team_ids)\n    OR $2::uuid = ANY(na.affected_team_ids)\n  )\n  AND n.created_at > NOW() - INTERVAL '24 hours'\nORDER BY na.impact_score DESC\nLIMIT 8;",
+        "additionalFields": {
+          "queryParams": "={{ [$('Split by Match').item.json.home_team_id, $('Split by Match').item.json.away_team_id] }}"
+        },
+        "options": {}
+      },
+      "id": "node-fetch-news",
+      "name": "Fetch News Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1780, 540],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  entity_id::text,\n  positive_ratio, negative_ratio, neutral_ratio,\n  dominant_sentiment, intensity, ai_summary\nFROM wcic.sentiment_snapshots\nWHERE entity_type = 'team'\n  AND entity_id IN ($1::uuid, $2::uuid)\n  AND captured_at > NOW() - INTERVAL '6 hours'\nORDER BY entity_id, captured_at DESC;",
+        "additionalFields": {
+          "queryParams": "={{ [$('Split by Match').item.json.home_team_id, $('Split by Match').item.json.away_team_id] }}"
+        },
+        "options": {}
+      },
+      "id": "node-fetch-sentiment",
+      "name": "Fetch Sentiment Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2000, 540],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Agrega todos os dados coletados em um único feature set\n// para passar ao SWF Match Predictor\n// ============================================================\nconst matchData  = $('Split by Match').item.json;\nconst statsRows  = $('Fetch Match Stats').all().map(i => i.json);\nconst newsRows   = $('Fetch News Context').all().map(i => i.json);\nconst sentRows   = $('Fetch Sentiment Context').all().map(i => i.json);\n\nconst stats = statsRows[0] || {};\n\n// Calcula pontos da forma recente\nconst calcFormPts = (formArr) => (formArr || []).reduce((acc, r) => acc + (r==='W'?3:r==='D'?1:0), 0);\n\n// Organiza sentimento por team_id\nconst sentMap = {};\nfor (const s of sentRows) {\n  if (!sentMap[s.entity_id]) sentMap[s.entity_id] = s;\n}\n\n// Detecta notícias de lesão/suspensão por time\nconst hasAlert = (teamId) => newsRows.some(n =>\n  n.is_alert && Array.isArray(n.affected_team_ids) && n.affected_team_ids.includes(teamId)\n);\n\nconst enrichedStats = {\n  ...stats,\n  home_form_pts: calcFormPts(stats.home_form),\n  away_form_pts: calcFormPts(stats.away_form),\n  home_has_injury_news: hasAlert(matchData.home_team_id),\n  away_has_injury_news: hasAlert(matchData.away_team_id),\n  home_suspended_count: 0, // Sprint 6: popular via players.is_suspended\n  away_suspended_count: 0,\n  home_sentiment_score: sentMap[matchData.home_team_id]?.positive_ratio || null,\n  away_sentiment_score: sentMap[matchData.away_team_id]?.positive_ratio || null,\n  home_news_impact_avg: newsRows.filter(n => (n.affected_team_ids||[]).includes(matchData.home_team_id)).reduce((a,n,_,arr) => a + n.impact_score/arr.length, 0) || null,\n  away_news_impact_avg: newsRows.filter(n => (n.affected_team_ids||[]).includes(matchData.away_team_id)).reduce((a,n,_,arr) => a + n.impact_score/arr.length, 0) || null,\n};\n\nreturn [{\n  json: {\n    match_id:           matchData.match_id,\n    home_team:          matchData.home_team,\n    away_team:          matchData.away_team,\n    home_team_id:       matchData.home_team_id,\n    away_team_id:       matchData.away_team_id,\n    stage:              matchData.stage,\n    scheduled_at:       matchData.scheduled_at,\n    venue_name:         matchData.venue_name,\n    stats:              enrichedStats,\n    news_context:       newsRows,\n    sentiment_context: {\n      home: sentMap[matchData.home_team_id] || null,\n      away: sentMap[matchData.away_team_id] || null,\n    },\n    correlationId: $('Init').first().json.correlationId,\n  }\n}];\n"
+      },
+      "id": "node-aggregate-features",
+      "name": "Aggregate Feature Set",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 540]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.match_stats (\n  match_id,\n  home_form, away_form, home_form_pts, away_form_pts,\n  home_goals_scored_avg, home_goals_conceded_avg,\n  away_goals_scored_avg, away_goals_conceded_avg,\n  h2h_home_wins, h2h_draws, h2h_away_wins,\n  h2h_home_goals_avg, h2h_away_goals_avg,\n  home_goals_in_tournament, home_matches_in_tournament,\n  away_goals_in_tournament, away_matches_in_tournament,\n  home_news_impact_avg, away_news_impact_avg,\n  home_sentiment_score, away_sentiment_score,\n  home_has_injury_news, away_has_injury_news,\n  computed_at\n) VALUES (\n  $1::uuid,\n  $2::char[], $3::char[], $4, $5,\n  $6, $7, $8, $9,\n  $10, $11, $12, $13, $14,\n  $15, $16, $17, $18,\n  $19, $20, $21, $22,\n  $23, $24,\n  NOW()\n)\nON CONFLICT (match_id) DO UPDATE SET\n  home_form = EXCLUDED.home_form,\n  away_form = EXCLUDED.away_form,\n  home_form_pts = EXCLUDED.home_form_pts,\n  away_form_pts = EXCLUDED.away_form_pts,\n  home_news_impact_avg = EXCLUDED.home_news_impact_avg,\n  away_news_impact_avg = EXCLUDED.away_news_impact_avg,\n  home_sentiment_score = EXCLUDED.home_sentiment_score,\n  away_sentiment_score = EXCLUDED.away_sentiment_score,\n  home_has_injury_news = EXCLUDED.home_has_injury_news,\n  away_has_injury_news = EXCLUDED.away_has_injury_news,\n  computed_at = NOW()\nRETURNING id::text;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.match_id,\n  $json.stats.home_form || [],\n  $json.stats.away_form || [],\n  $json.stats.home_form_pts || 0,\n  $json.stats.away_form_pts || 0,\n  $json.stats.home_goals_scored_avg || null,\n  $json.stats.home_goals_conceded_avg || null,\n  $json.stats.away_goals_scored_avg || null,\n  $json.stats.away_goals_conceded_avg || null,\n  $json.stats.h2h_home_wins || 0,\n  $json.stats.h2h_draws || 0,\n  $json.stats.h2h_away_wins || 0,\n  $json.stats.h2h_home_goals_avg || null,\n  $json.stats.h2h_away_goals_avg || null,\n  $json.stats.home_goals_in_tournament || 0,\n  $json.stats.home_matches_in_tournament || 0,\n  $json.stats.away_goals_in_tournament || 0,\n  $json.stats.away_matches_in_tournament || 0,\n  $json.stats.home_news_impact_avg || null,\n  $json.stats.away_news_impact_avg || null,\n  $json.stats.home_sentiment_score || null,\n  $json.stats.away_sentiment_score || null,\n  $json.stats.home_has_injury_news || false,\n  $json.stats.away_has_injury_news || false\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-persist-stats",
+      "name": "Persist Match Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 540],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=wcic:rl:wf05:openai"
+      },
+      "id": "node-check-rl",
+      "name": "Check OpenAI Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2660, 540],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rl = $input.first().json;\nconst current = parseInt(rl.value || '0');\nreturn [{ json: { rate_limited: current >= 20, current } }];\n"
+      },
+      "id": "node-rl-decision",
+      "name": "Rate Limit Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 540]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "rl-ok", "leftValue": "={{ $json.rate_limited }}", "rightValue": false, "operator": { "type": "boolean", "operation": "false" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-rl-gate",
+      "name": "Rate Limit Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3100, 540]
+    },
+    {
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "SWF - OpenAI Match Predictor", "mode": "name" },
+        "options": { "waitForSubWorkflow": true }
+      },
+      "id": "node-call-predictor",
+      "name": "Call Match Predictor",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [3320, 460]
+    },
+    {
+      "parameters": {
+        "operation": "incr",
+        "key": "=wcic:rl:wf05:openai"
+      },
+      "id": "node-incr-rl",
+      "name": "Increment Rate Limit",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3540, 460],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "=wcic:rl:wf05:openai",
+        "ttl": 60
+      },
+      "id": "node-rl-ttl",
+      "name": "Set RL TTL",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [3760, 460],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const pred = $input.first().json;\nconst featData = $('Aggregate Feature Set').item.json;\n\nif (pred.gpt_error) return [{ json: { persist: false, gpt_error: true, match_id: pred.match_id } }];\nif (!pred.home_win_prob || !pred.justification) return [{ json: { persist: false, incomplete: true } }];\n\nreturn [{ json: { persist: true, prediction: pred, feature_snapshot: featData.stats, match_id: featData.match_id } }];\n"
+      },
+      "id": "node-check-prediction",
+      "name": "Check Prediction Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3980, 460]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.predictions (\n  match_id, prediction_type, home_win_prob, draw_prob, away_win_prob,\n  predicted_home, predicted_away, confidence,\n  key_factors, risk_factors, justification,\n  over_under_2_5, both_teams_score,\n  ai_model, prompt_version, tokens_used,\n  raw_gpt_response, feature_snapshot\n) VALUES (\n  $1::uuid, 'pre_match',\n  $2::numeric, $3::numeric, $4::numeric,\n  $5::smallint, $6::smallint, $7::numeric,\n  $8::text[], $9::text[], $10,\n  $11, $12,\n  $13, $14, $15::integer,\n  $16::jsonb, $17::jsonb\n)\nRETURNING id::text, match_id::text, home_win_prob, draw_prob, away_win_prob, confidence;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.match_id,\n  $json.prediction.home_win_prob,\n  $json.prediction.draw_prob,\n  $json.prediction.away_win_prob,\n  $json.prediction.predicted_home_score,\n  $json.prediction.predicted_away_score,\n  $json.prediction.confidence,\n  $json.prediction.key_factors || [],\n  $json.prediction.risk_factors || [],\n  $json.prediction.justification,\n  $json.prediction.over_under_2_5 || null,\n  $json.prediction.both_teams_score || null,\n  $json.prediction.ai_model || 'gpt-4o',\n  $json.prediction.prompt_version || 'v1.0',\n  $json.prediction.tokens_used || 0,\n  JSON.stringify($json.prediction.raw_gpt_response || {}),\n  JSON.stringify($json.feature_snapshot || {})\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-persist-prediction",
+      "name": "Persist Prediction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4200, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ `wcic:cache:prediction:${$json.match_id}` }}",
+        "value": "={{ JSON.stringify({ id: $json.id, match_id: $json.match_id, home_win_prob: $json.home_win_prob, draw_prob: $json.draw_prob, away_win_prob: $json.away_win_prob, confidence: $json.confidence, cached_at: new Date().toISOString() }) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 3600
+      },
+      "id": "node-cache-prediction",
+      "name": "Cache Prediction (1h)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [4420, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "=wcic:pub:predictions.new",
+        "value": "={{ JSON.stringify({ prediction_id: $('Persist Prediction').item.json.id, match_id: $json.match_id || $('Check Prediction Result').item.json.match_id, correlation_id: $('Init').first().json.correlationId, ts: new Date().toISOString() }) }}"
+      },
+      "id": "node-publish-prediction",
+      "name": "Publish Prediction Event",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [4640, 400],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (execution_id, workflow_name, status, started_at, finished_at, duration_ms, trigger_type, correlation_id, items_processed, output_summary) VALUES ($1, 'WF-05-ai-prediction-engine', 'success', $2::timestamptz, NOW(), EXTRACT(EPOCH FROM (NOW()-$2::timestamptz))*1000, 'cron', $3::uuid, $4, $5::jsonb);",
+        "additionalFields": {
+          "queryParams": "={{ [$('Init').first().json.executionId, $('Init').first().json.startedAt, $('Init').first().json.correlationId, 1, JSON.stringify({ match_id: $('Check Prediction Result').item.json.match_id })] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [4860, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (30min)": { "main": [[{ "node": "Init", "type": "main", "index": 0 }]] },
+    "Init": { "main": [[{ "node": "Load Upcoming Matches", "type": "main", "index": 0 }]] },
+    "Load Upcoming Matches": { "main": [[{ "node": "Check Upcoming Matches", "type": "main", "index": 0 }]] },
+    "Check Upcoming Matches": { "main": [[{ "node": "Has Matches?", "type": "main", "index": 0 }]] },
+    "Has Matches?": {
+      "main": [
+        [{ "node": "Log No Matches", "type": "main", "index": 0 }],
+        [{ "node": "Split by Match", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split by Match": { "main": [[{ "node": "Fetch Match Stats", "type": "main", "index": 0 }]] },
+    "Fetch Match Stats": { "main": [[{ "node": "Fetch News Context", "type": "main", "index": 0 }]] },
+    "Fetch News Context": { "main": [[{ "node": "Fetch Sentiment Context", "type": "main", "index": 0 }]] },
+    "Fetch Sentiment Context": { "main": [[{ "node": "Aggregate Feature Set", "type": "main", "index": 0 }]] },
+    "Aggregate Feature Set": { "main": [[{ "node": "Persist Match Stats", "type": "main", "index": 0 }]] },
+    "Persist Match Stats": { "main": [[{ "node": "Check OpenAI Rate Limit", "type": "main", "index": 0 }]] },
+    "Check OpenAI Rate Limit": { "main": [[{ "node": "Rate Limit Decision", "type": "main", "index": 0 }]] },
+    "Rate Limit Decision": { "main": [[{ "node": "Rate Limit Gate", "type": "main", "index": 0 }]] },
+    "Rate Limit Gate": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Call Match Predictor", "type": "main", "index": 0 }]
+      ]
+    },
+    "Call Match Predictor": { "main": [[{ "node": "Increment Rate Limit", "type": "main", "index": 0 }]] },
+    "Increment Rate Limit": { "main": [[{ "node": "Set RL TTL", "type": "main", "index": 0 }]] },
+    "Set RL TTL": { "main": [[{ "node": "Check Prediction Result", "type": "main", "index": 0 }]] },
+    "Check Prediction Result": { "main": [[{ "node": "Persist Prediction", "type": "main", "index": 0 }]] },
+    "Persist Prediction": { "main": [[{ "node": "Cache Prediction (1h)", "type": "main", "index": 0 }]] },
+    "Cache Prediction (1h)": { "main": [[{ "node": "Publish Prediction Event", "type": "main", "index": 0 }]] },
+    "Publish Prediction Event": { "main": [[{ "node": "Log Success", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint5", "name": "sprint-5" }, { "id": "tag-predictions", "name": "predictions" }],
+  "triggerCount": 1,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf05-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/workflows/WF-05-ai-prediction-engine.json')); print(f'WF-05: {len(d[\"nodes\"])} nodes, {len(d[\"connections\"])} connections - JSON válido')"
