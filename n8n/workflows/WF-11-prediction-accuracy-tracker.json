@@ -1,0 +1,270 @@
+{
+  "name": "WF-11 - Prediction Accuracy Tracker",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "*/10 * * * *" }] }
+      },
+      "id": "node-schedule",
+      "name": "Schedule Trigger (10min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { v4: uuidv4 } = require('uuid');\nreturn [{\n  json: {\n    correlationId: uuidv4(),\n    startedAt:     new Date().toISOString(),\n    executionId:   $execution.id,\n    workflowName:  'WF-11-prediction-accuracy-tracker',\n  }\n}];\n"
+      },
+      "id": "node-init",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  p.id::text AS prediction_id,\n  p.match_id::text,\n  p.prediction_type::text,\n  p.home_win_prob,\n  p.draw_prob,\n  p.away_win_prob,\n  p.predicted_home::integer,\n  p.predicted_away::integer,\n  p.confidence,\n  m.home_score AS actual_home,\n  m.away_score AS actual_away,\n  m.status,\n  CASE\n    WHEN m.winner_team_id = m.home_team_id THEN 'home'\n    WHEN m.winner_team_id IS NULL AND m.status = 'finished' THEN 'draw'\n    WHEN m.winner_team_id = m.away_team_id THEN 'away'\n  END AS actual_outcome,\n  m.home_team_id::text,\n  m.away_team_id::text,\n  m.stage::text,\n  ht.name AS home_team_name,\n  at.name AS away_team_name,\n  DATE(m.scheduled_at AT TIME ZONE 'America/Sao_Paulo') AS match_date\nFROM wcic.predictions p\nJOIN wcic.matches m ON m.id = p.match_id\nJOIN wcic.teams ht ON ht.id = m.home_team_id\nJOIN wcic.teams at ON at.id = m.away_team_id\nWHERE m.status = 'finished'\n  AND p.was_correct IS NULL\n  AND p.prediction_type = 'pre_match'\n  AND m.home_score IS NOT NULL\n  AND m.away_score IS NOT NULL\nORDER BY m.finished_at DESC\nLIMIT 50;",
+        "options": {}
+      },
+      "id": "node-load-pending",
+      "name": "Load Pending Evaluations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all();\nconst initData = $('Init').first().json;\nif (rows.length === 0 || !rows[0].json.prediction_id) {\n  return [{ json: { hasPending: false, ...initData } }];\n}\nreturn [{ json: { hasPending: true, pendingCount: rows.length, ...initData } }];\n"
+      },
+      "id": "node-check-pending",
+      "name": "Check Pending",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "has-pending", "leftValue": "={{ $json.hasPending }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-has-pending-if",
+      "name": "Has Pending?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (execution_id, workflow_name, status, started_at, finished_at, duration_ms, trigger_type, correlation_id, items_processed, output_summary) VALUES ($1, 'WF-11-prediction-accuracy-tracker', 'success', $2::timestamptz, NOW(), EXTRACT(EPOCH FROM (NOW()-$2::timestamptz))*1000, 'cron', $3::uuid, 0, '{\"reason\":\"no_pending_evaluations\"}'::jsonb);",
+        "additionalFields": { "queryParams": "={{ [$('Init').first().json.executionId, $('Init').first().json.startedAt, $('Init').first().json.correlationId] }}" },
+        "options": {}
+      },
+      "id": "node-log-no-pending",
+      "name": "Log No Pending",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 260],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-split-predictions",
+      "name": "Split by Prediction",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1340, 540]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Calcula métricas de accuracy para uma previsão\n// ============================================================\nconst p = $input.first().json;\n\nconst actualOutcome = p.actual_outcome; // 'home' | 'draw' | 'away'\nif (!actualOutcome) {\n  // Resultado ainda não determinável (ex: empate em fase sem empate)\n  return [{ json: { skip: true, prediction_id: p.prediction_id } }];\n}\n\n// Outcome previsto = aquele com maior probabilidade\nconst probs = { home: p.home_win_prob, draw: p.draw_prob, away: p.away_win_prob };\nconst predictedOutcome = Object.entries(probs).reduce((a, b) => a[1] > b[1] ? a : b)[0];\nconst wasCorrect = predictedOutcome === actualOutcome;\n\n// Brier Score: Σ(p_i - I_i)² para i ∈ {home, draw, away}\n// I_i = 1 se outcome i ocorreu, 0 caso contrário\nconst I_home  = actualOutcome === 'home' ? 1 : 0;\nconst I_draw  = actualOutcome === 'draw' ? 1 : 0;\nconst I_away  = actualOutcome === 'away' ? 1 : 0;\n\nconst brierScore = parseFloat((\n  Math.pow(p.home_win_prob - I_home, 2) +\n  Math.pow(p.draw_prob    - I_draw,  2) +\n  Math.pow(p.away_win_prob - I_away, 2)\n).toFixed(4));\n\n// Accuracy score contínuo: 1 - BS/2 (normaliza BS para [0,1])\n// BS=0 → accuracy=1.0 (perfeito), BS=2 → accuracy=0.0 (pior possível)\nconst accuracyScore = parseFloat((1 - brierScore / 2).toFixed(2));\n\nreturn [{\n  json: {\n    prediction_id:    p.prediction_id,\n    match_id:         p.match_id,\n    home_team_id:     p.home_team_id,\n    away_team_id:     p.away_team_id,\n    stage:            p.stage,\n    match_date:       p.match_date,\n    home_team_name:   p.home_team_name,\n    away_team_name:   p.away_team_name,\n    actual_outcome,\n    actual_home:      p.actual_home,\n    actual_away:      p.actual_away,\n    predicted_outcome: predictedOutcome,\n    was_correct:      wasCorrect,\n    brier_score:      brierScore,\n    accuracy_score:   accuracyScore,\n    skip:             false,\n  }\n}];\n"
+      },
+      "id": "node-calculate-metrics",
+      "name": "Calculate Accuracy Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 540]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [{ "id": "skip-check", "leftValue": "={{ $json.skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-skip-if",
+      "name": "Skip?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1780, 540]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wcic.predictions SET\n  actual_outcome     = $2,\n  was_correct        = $3,\n  brier_score        = $4::numeric,\n  accuracy_score     = $5::numeric,\n  actual_home_score  = $6::smallint,\n  actual_away_score  = $7::smallint\nWHERE id = $1::uuid\nRETURNING id::text, was_correct, brier_score;",
+        "additionalFields": {
+          "queryParams": "={{ [\n  $json.prediction_id,\n  $json.actual_outcome,\n  $json.was_correct,\n  $json.brier_score,\n  $json.accuracy_score,\n  $json.actual_home,\n  $json.actual_away\n] }}"
+        },
+        "options": {}
+      },
+      "id": "node-update-prediction",
+      "name": "Update Prediction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2000, 460],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.prediction_accuracy (\n  period_type, period_label, prediction_type,\n  total_predictions, correct_predictions,\n  accuracy_pct, avg_confidence, brier_score_avg, team_id\n)\nSELECT\n  'daily',\n  $1::text,\n  'pre_match',\n  COUNT(*),\n  COUNT(*) FILTER (WHERE was_correct = true),\n  ROUND(100.0 * COUNT(*) FILTER (WHERE was_correct = true) / NULLIF(COUNT(*),0), 1),\n  ROUND(AVG(confidence)::numeric, 2),\n  ROUND(AVG(brier_score)::numeric, 4),\n  NULL\nFROM wcic.predictions p\nJOIN wcic.matches m ON m.id = p.match_id\nWHERE DATE(m.scheduled_at AT TIME ZONE 'America/Sao_Paulo') = $1::date\n  AND p.was_correct IS NOT NULL\n  AND p.prediction_type = 'pre_match'\nON CONFLICT ON CONSTRAINT prediction_accuracy_unique\nDO UPDATE SET\n  total_predictions   = EXCLUDED.total_predictions,\n  correct_predictions = EXCLUDED.correct_predictions,\n  accuracy_pct        = EXCLUDED.accuracy_pct,\n  avg_confidence      = EXCLUDED.avg_confidence,\n  brier_score_avg     = EXCLUDED.brier_score_avg,\n  calculated_at       = NOW();",
+        "additionalFields": {
+          "queryParams": "={{ [$json.match_date] }}"
+        },
+        "options": {}
+      },
+      "id": "node-upsert-daily",
+      "name": "Upsert Daily Accuracy",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2220, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.prediction_accuracy (\n  period_type, period_label, prediction_type,\n  total_predictions, correct_predictions,\n  accuracy_pct, avg_confidence, brier_score_avg, team_id\n)\nSELECT\n  'stage',\n  m.stage::text,\n  'pre_match',\n  COUNT(*),\n  COUNT(*) FILTER (WHERE p.was_correct = true),\n  ROUND(100.0 * COUNT(*) FILTER (WHERE p.was_correct = true) / NULLIF(COUNT(*),0), 1),\n  ROUND(AVG(p.confidence)::numeric, 2),\n  ROUND(AVG(p.brier_score)::numeric, 4),\n  NULL\nFROM wcic.predictions p\nJOIN wcic.matches m ON m.id = p.match_id\nWHERE m.stage::text = $1\n  AND p.was_correct IS NOT NULL\n  AND p.prediction_type = 'pre_match'\nGROUP BY m.stage\nON CONFLICT ON CONSTRAINT prediction_accuracy_unique\nDO UPDATE SET\n  total_predictions   = EXCLUDED.total_predictions,\n  correct_predictions = EXCLUDED.correct_predictions,\n  accuracy_pct        = EXCLUDED.accuracy_pct,\n  avg_confidence      = EXCLUDED.avg_confidence,\n  brier_score_avg     = EXCLUDED.brier_score_avg,\n  calculated_at       = NOW();",
+        "additionalFields": {
+          "queryParams": "={{ [$json.stage] }}"
+        },
+        "options": {}
+      },
+      "id": "node-upsert-stage",
+      "name": "Upsert Stage Accuracy",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 400],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.prediction_accuracy (\n  period_type, period_label, prediction_type,\n  total_predictions, correct_predictions,\n  accuracy_pct, avg_confidence, brier_score_avg, team_id\n)\nSELECT\n  'team',\n  $1::text,\n  'pre_match',\n  COUNT(*),\n  COUNT(*) FILTER (WHERE p.was_correct = true),\n  ROUND(100.0 * COUNT(*) FILTER (WHERE p.was_correct = true) / NULLIF(COUNT(*),0), 1),\n  ROUND(AVG(p.confidence)::numeric, 2),\n  ROUND(AVG(p.brier_score)::numeric, 4),\n  $2::uuid\nFROM wcic.predictions p\nJOIN wcic.matches m ON m.id = p.match_id\nWHERE (m.home_team_id = $2::uuid OR m.away_team_id = $2::uuid)\n  AND p.was_correct IS NOT NULL\n  AND p.prediction_type = 'pre_match'\nGROUP BY $2::uuid\nON CONFLICT ON CONSTRAINT prediction_accuracy_unique\nDO UPDATE SET\n  total_predictions   = EXCLUDED.total_predictions,\n  correct_predictions = EXCLUDED.correct_predictions,\n  accuracy_pct        = EXCLUDED.accuracy_pct,\n  avg_confidence      = EXCLUDED.avg_confidence,\n  brier_score_avg     = EXCLUDED.brier_score_avg,\n  calculated_at       = NOW();",
+        "additionalFields": {
+          "queryParams": "={{ [$json.home_team_name + ' vs ' + $json.away_team_name, $json.home_team_id] }}"
+        },
+        "options": {}
+      },
+      "id": "node-upsert-team-home",
+      "name": "Upsert Home Team Accuracy",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2660, 340],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.prediction_accuracy (\n  period_type, period_label, prediction_type,\n  total_predictions, correct_predictions,\n  accuracy_pct, avg_confidence, brier_score_avg, team_id\n)\nSELECT\n  'team',\n  $1::text,\n  'pre_match',\n  COUNT(*),\n  COUNT(*) FILTER (WHERE p.was_correct = true),\n  ROUND(100.0 * COUNT(*) FILTER (WHERE p.was_correct = true) / NULLIF(COUNT(*),0), 1),\n  ROUND(AVG(p.confidence)::numeric, 2),\n  ROUND(AVG(p.brier_score)::numeric, 4),\n  $2::uuid\nFROM wcic.predictions p\nJOIN wcic.matches m ON m.id = p.match_id\nWHERE (m.home_team_id = $2::uuid OR m.away_team_id = $2::uuid)\n  AND p.was_correct IS NOT NULL\n  AND p.prediction_type = 'pre_match'\nGROUP BY $2::uuid\nON CONFLICT ON CONSTRAINT prediction_accuracy_unique\nDO UPDATE SET\n  total_predictions   = EXCLUDED.total_predictions,\n  correct_predictions = EXCLUDED.correct_predictions,\n  accuracy_pct        = EXCLUDED.accuracy_pct,\n  avg_confidence      = EXCLUDED.avg_confidence,\n  brier_score_avg     = EXCLUDED.brier_score_avg,\n  calculated_at       = NOW();",
+        "additionalFields": {
+          "queryParams": "={{ [$json.home_team_name + ' vs ' + $json.away_team_name, $json.away_team_id] }}"
+        },
+        "options": {}
+      },
+      "id": "node-upsert-team-away",
+      "name": "Upsert Away Team Accuracy",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2660, 500],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=wcic:cache:accuracy:overall",
+        "value": "={{ JSON.stringify({ updated_at: new Date().toISOString(), match_id: $('Calculate Accuracy Metrics').item.json.match_id }) }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 600
+      },
+      "id": "node-invalidate-cache",
+      "name": "Invalidate Accuracy Cache",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2880, 420],
+      "credentials": { "redis": { "id": "cred-redis", "name": "WCIC Redis" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wcic.workflow_logs (execution_id, workflow_name, status, started_at, finished_at, duration_ms, trigger_type, correlation_id, items_processed, output_summary) VALUES ($1, 'WF-11-prediction-accuracy-tracker', 'success', $2::timestamptz, NOW(), EXTRACT(EPOCH FROM (NOW()-$2::timestamptz))*1000, 'cron', $3::uuid, 1, $4::jsonb);",
+        "additionalFields": {
+          "queryParams": "={{ [$('Init').first().json.executionId, $('Init').first().json.startedAt, $('Init').first().json.correlationId, JSON.stringify({ prediction_id: $('Calculate Accuracy Metrics').item.json.prediction_id, was_correct: $('Calculate Accuracy Metrics').item.json.was_correct, brier_score: $('Calculate Accuracy Metrics').item.json.brier_score })] }}"
+        },
+        "options": {}
+      },
+      "id": "node-log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3100, 420],
+      "credentials": { "postgres": { "id": "cred-postgres", "name": "WCIC PostgreSQL" } }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (10min)": { "main": [[{ "node": "Init", "type": "main", "index": 0 }]] },
+    "Init": { "main": [[{ "node": "Load Pending Evaluations", "type": "main", "index": 0 }]] },
+    "Load Pending Evaluations": { "main": [[{ "node": "Check Pending", "type": "main", "index": 0 }]] },
+    "Check Pending": { "main": [[{ "node": "Has Pending?", "type": "main", "index": 0 }]] },
+    "Has Pending?": {
+      "main": [
+        [{ "node": "Log No Pending", "type": "main", "index": 0 }],
+        [{ "node": "Split by Prediction", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split by Prediction": { "main": [[{ "node": "Calculate Accuracy Metrics", "type": "main", "index": 0 }]] },
+    "Calculate Accuracy Metrics": { "main": [[{ "node": "Skip?", "type": "main", "index": 0 }]] },
+    "Skip?": {
+      "main": [
+        [{ "node": "Log Success", "type": "main", "index": 0 }],
+        [{ "node": "Update Prediction", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Prediction": { "main": [[{ "node": "Upsert Daily Accuracy", "type": "main", "index": 0 }]] },
+    "Upsert Daily Accuracy": { "main": [[{ "node": "Upsert Stage Accuracy", "type": "main", "index": 0 }]] },
+    "Upsert Stage Accuracy": {
+      "main": [[
+        { "node": "Upsert Home Team Accuracy", "type": "main", "index": 0 },
+        { "node": "Upsert Away Team Accuracy", "type": "main", "index": 0 }
+      ]]
+    },
+    "Upsert Home Team Accuracy": { "main": [[{ "node": "Invalidate Accuracy Cache", "type": "main", "index": 0 }]] },
+    "Upsert Away Team Accuracy": { "main": [[{ "node": "Invalidate Accuracy Cache", "type": "main", "index": 0 }]] },
+    "Invalidate Accuracy Cache": { "main": [[{ "node": "Log Success", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "America/Sao_Paulo"
+  },
+  "staticData": null,
+  "tags": [{ "id": "tag-sprint5", "name": "sprint-5" }, { "id": "tag-accuracy", "name": "accuracy-tracking" }],
+  "triggerCount": 1,
+  "updatedAt": "2025-06-01T00:00:00.000Z",
+  "versionId": "wf11-v1-0-0"
+}
+JSONEOF
+python3 -c "import json; d=json.load(open('/home/claude/wcic/n8n/workflows/WF-11-prediction-accuracy-tracker.json')); print(f'WF-11: {len(d[\"nodes\"])} nodes, {len(d[\"connections\"])} connections - JSON válido')"
